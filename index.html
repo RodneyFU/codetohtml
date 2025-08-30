@@ -1,0 +1,2529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Analysis</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        h2 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 5px; }
+        pre { background-color: #1e1e1e; color: #dcdcdc; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        code { font-family: 'Courier New', Courier, monospace; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h1>Python Code Analysis</h1>
+    <h2>.\ai_models.py</h2>
+    <pre><code>import torch
+from torch import nn
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from torch.optim import Adam
+import onnx
+import onnxruntime as ort
+from onnxmltools import convert_xgboost, convert_sklearn, convert_lightgbm
+from onnxconverter_common import FloatTensorType, convert_float_to_float16
+from transformers import pipeline, TimeSeriesTransformerModel, TimeSeriesTransformerConfig, DistilBertTokenizer, DistilBertForSequenceClassification
+import logging
+from scipy.stats import ks_2samp
+import os
+import numpy as np
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor
+import lightgbm as lgb
+from pathlib import Path
+import joblib
+import redis
+from sklearn.metrics import mean_squared_error, r2_score
+from utils import save_data, check_hardware, get_redis_client
+from datetime import timedelta, datetime
+import asyncio
+import aiohttp
+from textblob import TextBlob
+import aiosqlite
+
+# 全局特徵常量，避免重複定義
+FEATURES = ['close', 'RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate']
+
+class LSTMModel(nn.Module):
+    """LSTM 模型：用於價格預測，捕捉時間序列模式。"""
+    def __init__(self, input_size=10, hidden_size=50, num_layers=2, output_size=1, device=torch.device('cpu')):
+        """初始化 LSTM 模型，支援多個技術指標和經濟數據的輸入大小。"""
+        super().__init__()
+        self.device = device
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.to(device)
+ 
+    def forward(self, x):
+        # 關鍵邏輯：將輸入數據移動到指定設備，並通過 LSTM 和全連接層進行前向傳播。
+        x = x.to(self.device)
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
+def validate_data(df: pd.DataFrame, required_features: list) -&gt; bool:
+    """驗證輸入數據是否包含必要的特徵欄位。"""
+    missing_features = [f for f in required_features if f not in df.columns]
+    if missing_features:
+        logging.error(f"缺少必要特徵: {missing_features}")
+        return False
+    if df[required_features].isna().any().any():
+        logging.error("數據包含 NaN 值")
+        return False
+    return True
+def train_lstm_model(df: pd.DataFrame, epochs: int = 50, device=torch.device('cpu')):
+    """訓練 LSTM：使用歷史數據訓練，保存為 ONNX 格式。"""
+    # 函數說明：此函數負責訓練 LSTM 模型，使用指定的特徵進行價格預測，並將模型轉換為 ONNX 格式以便跨平台使用。
+    try:
+        if not validate_data(df, FEATURES):
+            return None
+        # 關鍵邏輯：移除 NaN 值並準備輸入 X 和目標 y（下一期的 Close 值）。
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
+        if len(X) != len(y):
+            logging.error("X 和 y 長度不匹配")
+            return None
+        if len(X) == 0:
+            logging.error("X 數據為空，無法訓練 LSTM")
+            return None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = LSTMModel(input_size=len(FEATURES), device=device)
+        optimizer = Adam(model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        # 關鍵邏輯：訓練循環，使用反向傳播更新模型參數。
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            output = model(torch.tensor(X_train, dtype=torch.float32, device=device).unsqueeze(1))
+            loss = criterion(output.squeeze(), torch.tensor(y_train, dtype=torch.float32, device=device))
+            loss.backward()
+            optimizer.step()
+     
+        # 保存 PyTorch 模型
+        torch.save(model.state_dict(), 'models/lstm_model.pth')
+        # 轉換為 ONNX
+        dummy_input = torch.tensor(X_train[:1], dtype=torch.float32).unsqueeze(1)
+        torch.onnx.export(model, dummy_input, "models/lstm_model.onnx", input_names=["input"], output_names=["output"], opset_version=11)
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/lstm_model.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/lstm_model_quantized.onnx")
+        logging.info("LSTM 模型訓練完成並轉換為 ONNX")
+        return model
+    except Exception as e:
+        logging.error(f"LSTM 訓練錯誤: {e}")
+        return None
+def train_xgboost_model(df: pd.DataFrame):
+    """訓練 XGBoost 模型：用於短期價格預測，保存為 ONNX 格式。"""
+    # 函數說明：訓練 XGBoost 模型，用於短期價格預測，並計算性能指標後轉換為 ONNX 格式。
+    try:
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
+        if len(X) != len(y):
+            logging.error("X 和 y 長度不匹配")
+            return None
+        if len(X) == 0:
+            logging.error("X 數據為空，無法訓練 XGBoost")
+            return None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1)
+        model.fit(X_train, y_train)
+        # 關鍵邏輯：計算模型性能指標，如 RMSE 和 R² 分數。
+        y_pred = model.predict(X_test)
+        rmse = mean_squared_error(y_test, y_pred, squared=False)
+        r2 = r2_score(y_test, y_pred)
+        logging.info(f"XGBoost 價格預測性能：RMSE={rmse:.4f}, R²={r2:.4f}")
+        joblib.dump(model, 'models/xgboost_model.pkl')
+        # 轉換為 ONNX
+        onnx_model = convert_xgboost(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
+        onnx.save(onnx_model, "models/xgboost_model.onnx")
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/xgboost_model.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/xgboost_model_quantized.onnx")
+        logging.info("XGBoost 模型訓練完成並轉換為 ONNX")
+        return model
+    except Exception as e:
+        logging.error(f"XGBoost 訓練錯誤: {e}")
+        return None
+def train_random_forest_model(df: pd.DataFrame):
+    """訓練隨機森林模型：用於短期價格預測，保存為 ONNX 格式。"""
+    # 函數說明：訓練 RandomForest 模型，用於中期價格預測，並轉換為 ONNX 格式。
+    try:
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['close'].shift(-1).dropna().values
+        if len(X) != len(y):
+            logging.error("X 和 y 長度不匹配")
+            return None
+        if len(X) == 0:
+            logging.error("X 數據為空，無法訓練 RandomForest")
+            return None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        joblib.dump(model, 'models/rf_model.pkl')
+        # 轉換為 ONNX
+        onnx_model = convert_sklearn(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
+        onnx.save(onnx_model, "models/rf_model.onnx")
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/rf_model.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/rf_model_quantized.onnx")
+        logging.info("RandomForest 模型訓練完成並轉換為 ONNX")
+        return model
+    except Exception as e:
+        logging.error(f"RandomForest 訓練錯誤: {e}")
+        return None
+def train_lightgbm_model(df: pd.DataFrame):
+    """訓練 LightGBM 模型：用於波動性預測（ATR），保存為 ONNX 格式。"""
+    # 函數說明：訓練 LightGBM 模型，用於波動性預測，並與 XGBoost 比較性能後轉換為 ONNX 格式。
+    try:
+        if not validate_data(df, FEATURES):
+            return None
+        X = df[FEATURES].dropna().values[:-1]
+        y = df['ATR'].shift(-1).dropna().values
+        if len(X) != len(y):
+            logging.error("X 和 y 長度不匹配")
+            return None
+        if len(X) == 0:
+            logging.error("X 數據為空，無法訓練 LightGBM")
+            return None
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.1)
+        model.fit(X_train, y_train)
+        # 關鍵邏輯：計算 LightGBM 性能指標，並訓練 XGBoost 進行比較。
+        y_pred = model.predict(X_test)
+        rmse = mean_squared_error(y_test, y_pred, squared=False)
+        r2 = r2_score(y_test, y_pred)
+        logging.info(f"LightGBM 波動性預測性能：RMSE={rmse:.4f}, R²={r2:.4f}")
+        # 比較 XGBoost 的波動性預測性能
+        xgb_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1)
+        xgb_model.fit(X_train, y_train)
+        xgb_pred = xgb_model.predict(X_test)
+        xgb_rmse = mean_squared_error(y_test, xgb_pred, squared=False)
+        xgb_r2 = r2_score(y_test, xgb_pred)
+        logging.info(f"XGBoost 波動性預測性能：RMSE={xgb_rmse:.4f}, R²={xgb_r2:.4f}")
+        logging.info(f"性能比較：LightGBM RMSE={rmse:.4f} vs XGBoost RMSE={xgb_rmse:.4f}, LightGBM R²={r2:.4f} vs XGBoost R²={xgb_r2:.4f}")
+        joblib.dump(model, 'models/lightgbm_model.pkl')
+        # 轉換為 ONNX
+        onnx_model = convert_lightgbm(model, initial_types=[('input', FloatTensorType([None, len(FEATURES)]))])
+        onnx.save(onnx_model, "models/lightgbm_model.onnx")
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/lightgbm_model.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/lightgbm_model_quantized.onnx")
+        logging.info("LightGBM 模型訓練完成並轉換為 ONNX")
+        return model
+    except Exception as e:
+        logging.error(f"LightGBM 訓練錯誤: {e}")
+        return None
+def train_timeseries_transformer(df: pd.DataFrame, epochs: int = 10, device=torch.device('cpu')):
+    """訓練 TimeSeriesTransformer 模型：用於時間序列預測，保存為 ONNX 格式。"""
+    # 函數說明：訓練 TimeSeriesTransformer 模型，用於時間序列預測，處理序列數據並轉換為 ONNX 格式。
+    try:
+        seq_len = 60
+        # 關鍵邏輯：移除 NaN 值並構造時間序列輸入 X 和目標 y。
+        df_clean = df.dropna(subset=FEATURES + ['close'])
+        num_seq = len(df_clean) - seq_len
+        if num_seq &lt;= 0:
+            logging.error("數據不足以構造時間序列，無法訓練 TimeSeriesTransformer")
+            return None
+        X = np.array([df_clean[FEATURES].iloc[i:i+seq_len].values for i in range(num_seq)])
+        y = df_clean['close'].iloc[seq_len:].values
+        if len(X) != len(y):
+            logging.error("X 和 y 長度不匹配")
+            return None
+        config = TimeSeriesTransformerConfig(
+            input_size=len(FEATURES), time_series_length=seq_len, prediction_length=1, d_model=64
+        )
+        model = TimeSeriesTransformerModel(config).to(device)
+        optimizer = Adam(model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        # 關鍵邏輯：訓練循環，使用反向傳播更新模型參數。
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            output = model(torch.tensor(X_train, dtype=torch.float32, device=device)).logits
+            loss = criterion(output.squeeze(), torch.tensor(y_train, dtype=torch.float32, device=device))
+            loss.backward()
+            optimizer.step()
+        # 保存 PyTorch 模型
+        torch.save(model.state_dict(), 'models/timeseries_transformer.pth')
+        # 轉換為 ONNX
+        dummy_input = torch.tensor(X_train[:1], dtype=torch.float32, device=device)
+        torch.onnx.export(model, dummy_input, "models/timeseries_transformer.onnx", input_names=["input"], output_names=["output"], opset_version=11)
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/timeseries_transformer.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/timeseries_transformer_quantized.onnx")
+        logging.info("TimeSeriesTransformer 模型訓練完成並轉換為 ONNX")
+        return model
+    except Exception as e:
+        logging.error(f"TimeSeriesTransformer 訓練錯誤: {e}")
+        return None
+def train_distilbert(df: pd.DataFrame, device=torch.device('cpu')):
+    """訓練 DistilBERT 模型：用於情緒分析，保存為 ONNX 格式。"""
+    # 函數說明：訓練 DistilBERT 模型，用於情緒分析，處理文本數據並轉換為 ONNX 格式。
+    try:
+        tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+        model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased').to(device)
+        texts = df['tweets'].dropna().tolist()[:100]
+        labels = df['sentiment'].dropna().tolist()[:100]
+        if not texts or len(texts) != len(labels):
+            logging.error("無效的文本或標籤數據")
+            return None, None
+        # 關鍵邏輯：對文本進行 tokenization 並準備輸入。
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        labels = torch.tensor(labels, dtype=torch.long, device=device)
+        optimizer = Adam(model.parameters(), lr=5e-5)
+        for epoch in range(3):
+            optimizer.zero_grad()
+            outputs = model(**inputs).logits
+            loss = nn.CrossEntropyLoss()(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        # 保存 PyTorch 模型
+        torch.save(model.state_dict(), 'models/distilbert_model.pth')
+        # 轉換為 ONNX
+        dummy_input = {
+            'input_ids': tokenizer(['dummy text'], return_tensors="pt", padding=True, truncation=True)['input_ids'].to(device),
+            'attention_mask': tokenizer(['dummy text'], return_tensors="pt", padding=True, truncation=True)['attention_mask'].to(device)
+        }
+        torch.onnx.export(model, (dummy_input['input_ids'], dummy_input['attention_mask']),
+                          "models/distilbert_model.onnx", input_names=["input_ids", "attention_mask"], output_names=["output"], opset_version=11)
+        # 量化為 FP16
+        model_fp32 = onnx.load("models/distilbert_model.onnx")
+        model_fp16 = convert_float_to_float16(model_fp32)
+        onnx.save(model_fp16, "models/distilbert_model_quantized.onnx")
+        logging.info("DistilBERT 模型訓練完成並轉換為 ONNX")
+        return model, tokenizer
+    except Exception as e:
+        logging.error(f"DistilBERT 訓練錯誤: {e}")
+        return None, None
+async def predict_sentiment(date: str, db_path: str, config: dict) -&gt; float:
+    """情緒分析：從 X API 獲取推文，計算 polarity 並儲存結果，使用 DistilBERT，加入 Redis 快取。"""
+    # 函數說明：進行情緒分析，從 X (Twitter) API 獲取推文，使用 DistilBERT 和 TextBlob 計算情緒分數，並快取結果。
+    use_redis = config.get('system_config', {}).get('use_redis', True)
+   
+    redis_client = get_redis_client(config)
+    try:
+        end_date = pd.to_datetime(date)
+        start_date = end_date - timedelta(days=1)
+        cache_key = f"sentiment_{end_date.strftime('%Y-%m-%d')}"
+        # 關鍵邏輯：檢查 Redis 快取，若存在則直接返回。
+        # 檢查 Redis 快取
+        if use_redis and redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    logging.info(f"從 Redis 快取載入情緒分數: {cache_key}")
+                    return float(cached)
+            except redis.RedisError as e:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Redis 快取查詢失敗：{str(e)}，跳過 Redis")
+                logging.warning(f"Redis cache query failed: {str(e)}，falling back to API", extra={'mode': 'predict_sentiment'})
+        start_time = start_date.strftime('%Y-%m-%dT00:00:00Z')
+        end_time = end_date.strftime('%Y-%m-%dT23:59:59Z')
+        X_BEARER_TOKEN = config['api_key'].get('x_bearer_token', '')
+        if not X_BEARER_TOKEN:
+            logging.error("X Bearer Token 未配置")
+            return 0.0
+        query = "(USDJPY OR USD/JPY OR 'Federal Reserve') lang:en"
+        logging.info(f"從 X API 獲取推文：query={query}, start={start_time}, end={end_time}")
+        url = "https://api.x.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
+        params = {'query': query, 'start_time': start_time, 'end_time': end_time, 'max_results': 100}
+        polarities = []
+        tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+        model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased')
+        model.load_state_dict(torch.load('models/distilbert_model.pth'))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        model.eval()
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(5):
+                try:
+                    async with session.get(url, headers=headers, params=params, timeout=10) as response:
+                        data = await response.json()
+                        if response.status != 200 or 'data' not in data or not data['data']:
+                            logging.warning(f"X API 數據為空或格式錯誤: {data}")
+                            return 0.0
+                        tweets = data['data']
+                        # 關鍵邏輯：對每條推文計算情緒分數，結合 DistilBERT 和 TextBlob。
+                        for tweet in tweets:
+                            text = tweet['text']
+                            inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+                            with torch.no_grad():
+                                outputs = model(**inputs).logits
+                            score = torch.softmax(outputs, dim=1)[0][1].item() - torch.softmax(outputs, dim=1)[0][0].item()
+                            tb_polarity = TextBlob(text).sentiment.polarity
+                            combined_score = 0.7 * score + 0.3 * tb_polarity
+                            polarities.append(combined_score)
+                        break
+                except Exception as e:
+                    if attempt == 4:
+                        logging.error(f"X API 獲取失敗: {str(e)}")
+                        return 0.0
+                    await asyncio.sleep(2 ** attempt * 4)
+        if polarities:
+            avg_score = sum(polarities) / len(polarities)
+            logging.info(f"計算平均 polarity 分數: {avg_score} (DistilBERT 70%, TextBlob 30%)")
+            # 存入 Redis 快取，設置 24 小時過期
+            if use_redis and redis_client:
+                try:
+                    redis_client.setex(cache_key, 24 * 3600, str(avg_score))
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將情緒分數快取至 Redis")
+                    logging.info(f"Cached sentiment score to Redis: key={cache_key}")
+                except redis.RedisError as e:
+                    logging.warning(f"無法快取至 Redis: {str(e)}")
+        else:
+            avg_score = 0.0
+            logging.warning("無推文數據，使用預設值 0.0")
+        sentiment_df = pd.DataFrame({'date': [end_date], 'sentiment': [avg_score]})
+        await save_data(sentiment_df, timeframe='1 day', db_path=db_path, data_type='sentiment')
+        return avg_score
+    except Exception as e:
+        logging.error(f"情緒分析錯誤: {e}")
+        return 0.0
+def integrate_sentiment(polarity: float) -&gt; float:
+    """整合情緒分數：將 polarity 轉換為決策調整值，並檢查極端情緒。"""
+    # 函數說明：根據情緒分數調整決策值，若極端則暫停交易。
+    if abs(polarity) &gt; 0.8:
+        logging.warning(f"極端情緒分數: {polarity}，建議暫停交易")
+        return 0.0
+    if polarity &gt; 0.1:
+        return 0.1
+    elif polarity &lt; -0.1:
+        return -0.1
+    return 0.0
+def detect_drift(old_data: pd.DataFrame, new_data: pd.DataFrame, threshold: float = 0.05) -&gt; bool:
+    """檢測數據漂移：使用 KS 檢驗比較分佈。"""
+    # 函數說明：使用 Kolmogorov-Smirnov 檢驗檢測數據分佈漂移。
+    stat, p_value = ks_2samp(old_data['close'], new_data['close'])
+    return p_value &lt; threshold
+def predict(model_path: str, input_data: pd.DataFrame, provider='VitisAIExecutionProvider'):
+    """使用 ONNX 模型進行推理，支援 NPU。"""
+    # 函數說明：載入 ONNX 模型並進行預測，支持多種執行提供者。
+    try:
+        session = ort.InferenceSession(model_path, providers=[provider, 'CUDAExecutionProvider', 'CPUExecutionProvider'])
+        X = input_data[FEATURES].iloc[-1:].values.astype(np.float32)
+        return session.run(None, {'input': X})[0][0]
+    except Exception as e:
+        logging.error(f"ONNX 推理錯誤: {e}")
+        return 0.0
+def update_model(df: pd.DataFrame, model_path: str = 'models', session: str = 'normal', device_config: dict = None) -&gt; dict:
+    """更新多模型：個別檢查並訓練或載入模型，根據時段加權預測。"""
+    # 函數說明：更新多個模型，若數據漂移則重新訓練，並定義加權預測函數。
+    try:
+        model_dir = Path(model_path)
+        model_dir.mkdir(exist_ok=True)
+        models = {}
+        # 關鍵邏輯：檢測數據漂移，若存在則重新訓練模型。
+        old_data = df.iloc[:-1000] if len(df) &gt; 1000 else df
+        new_data = df.iloc[-1000:]
+        data_drift = detect_drift(old_data, new_data)
+        device = device_config.get('lstm', torch.device('cpu')) if device_config else torch.device('cpu')
+        df_clean = df[FEATURES].dropna()
+        X = df_clean.values[:-1]
+        y = df['close'].shift(-1).dropna().values
+        # LSTM 模型
+        lstm_path = model_dir / 'lstm_model.pth'
+        lstm_onnx_path = model_dir / 'lstm_model_quantized.onnx'
+        if not lstm_path.exists() or data_drift:
+            models['lstm'] = train_lstm_model(df, device=device)
+        else:
+            models['lstm'] = lstm_onnx_path
+            logging.info("載入現有 LSTM ONNX 模型")
+        # XGBoost 模型
+        xgboost_path = model_dir / 'xgboost_model.pkl'
+        xgboost_onnx_path = model_dir / 'xgboost_model_quantized.onnx'
+        if not xgboost_path.exists() or data_drift:
+            models['xgboost'] = train_xgboost_model(df)
+        else:
+            models['xgboost'] = xgboost_onnx_path
+            logging.info("載入現有 XGBoost ONNX 模型")
+        # RandomForest 模型
+        rf_path = model_dir / 'rf_model.pkl'
+        rf_onnx_path = model_dir / 'rf_model_quantized.onnx'
+        if not rf_path.exists() or data_drift:
+            models['rf_model'] = train_random_forest_model(df)
+        else:
+            models['rf_model'] = rf_onnx_path
+            logging.info("載入現有 RandomForest ONNX 模型")
+        # LightGBM 模型
+        lightgbm_path = model_dir / 'lightgbm_model.pkl'
+        lightgbm_onnx_path = model_dir / 'lightgbm_model_quantized.onnx'
+        if not lightgbm_path.exists() or data_drift:
+            models['lightgbm'] = train_lightgbm_model(df)
+        else:
+            models['lightgbm'] = lightgbm_onnx_path
+            logging.info("載入現有 LightGBM ONNX 模型")
+        # TimeSeriesTransformer 模型
+        transformer_path = model_dir / 'timeseries_transformer.pth'
+        transformer_onnx_path = model_dir / 'timeseries_transformer_quantized.onnx'
+        if not transformer_path.exists() or data_drift:
+            models['timeseries_transformer'] = train_timeseries_transformer(df, device=device)
+        else:
+            models['timeseries_transformer'] = transformer_onnx_path
+            logging.info("載入現有 TimeSeriesTransformer ONNX 模型")
+        # DistilBERT 模型
+        distilbert_path = model_dir / 'distilbert_model.pth'
+        distilbert_onnx_path = model_dir / 'distilbert_model_quantized.onnx'
+        if not distilbert_path.exists() or data_drift:
+            models['distilbert'], _ = train_distilbert(df, device=device)
+        else:
+            models['distilbert'] = distilbert_onnx_path
+            logging.info("載入現有 DistilBERT ONNX 模型")
+        # 加權預測
+        weights = {
+            'lstm': 0.2, 'xgboost': 0.3, 'rf_model': 0.2, 'lightgbm': 0.2, 'timeseries_transformer': 0.1
+        } if session == 'high_volatility' else {
+            'lstm': 0.3, 'xgboost': 0.2, 'rf_model': 0.2, 'lightgbm': 0.2, 'timeseries_transformer': 0.1
+        }
+        def predict_price(input_data: pd.DataFrame):
+            # 內部函數說明：根據輸入數據進行加權預測，忽略情緒模型。
+            if input_data.empty or FEATURES[0] not in input_data.columns:
+                logging.error("輸入數據為空或缺少必要欄位")
+                return 0.0
+            predictions = {}
+            for name, model in models.items():
+                if name == 'distilbert':
+                    continue
+                if isinstance(model, str):
+                    predictions[name] = predict(model, input_data)
+                else:
+                    X = input_data[FEATURES].iloc[-1:].values
+                    if name == 'lstm' or name == 'timeseries_transformer':
+                        X_tensor = torch.tensor(X, dtype=torch.float32, device=device).unsqueeze(1)
+                        model.eval()
+                        with torch.no_grad():
+                            predictions[name] = model(X_tensor).item()
+                    else:
+                        predictions[name] = model.predict(X)[0]
+            final_pred = sum(weights[name] * pred for name, pred in predictions.items())
+            return final_pred
+        models['predict'] = predict_price
+        logging.info("多模型更新完成")
+        return models
+    except Exception as e:
+        logging.error(f"多模型更新錯誤: {e}")
+        return {}</code></pre>
+
+    <h2>.\code_to_html.py</h2>
+    <pre><code>import os
+
+def py_to_html(root_dir: str = '.', output_file: str = 'all_code.html'):
+    """將所有 PY 檔內容合併到 HTML。
+    邏輯：遍歷目錄，讀取 PY 檔，寫入 HTML 並標記檔名。
+    """
+    html_content = """&lt;!DOCTYPE html&gt;
+&lt;html lang="en"&gt;
+&lt;head&gt;
+    &lt;meta charset="UTF-8"&gt;
+    &lt;meta name="viewport" content="width=device-width, initial-scale=1.0"&gt;
+    &lt;title&gt;Code Analysis&lt;/title&gt;
+    &lt;style&gt;
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        h2 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 5px; }
+        pre { background-color: #1e1e1e; color: #dcdcdc; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        code { font-family: 'Courier New', Courier, monospace; font-size: 14px; }
+    &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+    &lt;h1&gt;Python Code Analysis&lt;/h1&gt;
+"""
+
+    with open(output_file, 'w', encoding='utf-8') as out:
+        exclude = ['venv', 'test']
+        for subdir, dirs, files in os.walk(root_dir, topdown=True):
+            for jump in exclude:
+                if subdir == root_dir and jump in dirs:
+                    dirs.remove(jump)
+                    print(f"跳過根目錄的資料夾：{jump}")
+            for file in files:
+                if file.endswith(('.py', '.json')) and not file.endswith(('py.py', 'txt.py')) and not file.startswith(('grafana_dashboard', 'api_key', 'data_fetcher', 'model')):
+                    path = os.path.join(subdir, file)
+                    print(f"合併：{path}")
+                    html_content += f'    &lt;h2&gt;{path}&lt;/h2&gt;\n'
+                    html_content += '    &lt;pre&gt;&lt;code&gt;'
+                    with open(path, 'r', encoding='utf-8') as f:
+                        # Escape HTML special characters to ensure valid rendering
+                        content = f.read().replace('&amp;', '&amp;amp;').replace('&lt;', '&amp;lt;').replace('&gt;', '&amp;gt;')
+                        html_content += content
+                    html_content += '&lt;/code&gt;&lt;/pre&gt;\n\n'        
+        html_content += """&lt;/body&gt;
+&lt;/html&gt;"""
+        out.write(html_content)
+    
+    print(f"合併完成：{output_file}")
+
+if __name__ == "__main__":
+    py_to_html()</code></pre>
+
+    <h2>.\data_acquisition.py</h2>
+    <pre><code>import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
+import json
+import time
+import aiohttp
+import aiosqlite
+import investpy
+from utils import initialize_db, save_data, get_proxy, test_proxy, fetch_api_data, get_redis_client, filter_future_dates
+from datetime import datetime, timedelta
+import asyncio
+import os
+from pathlib import Path
+import logging
+import redis
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import traceback
+# 速率限制器類
+class RateLimiter:
+    def __init__(self, calls: int, period: float):
+        """初始化速率限制器：calls 次/period 秒"""
+        self.calls = calls
+        self.period = period
+        self.timestamps = []
+
+    async def wait(self):
+        """等待直到允許下一次請求"""
+        current_time = time.time()
+        # 移除超出時間窗口的時間戳
+        self.timestamps = [t for t in self.timestamps if current_time - t &lt; self.period]
+        if len(self.timestamps) &gt;= self.calls:
+            # 等待直到最早的時間戳超出窗口
+            sleep_time = self.period - (current_time - self.timestamps[0])
+            if sleep_time &gt; 0:
+                logging.info(f"Rate limiter: Waiting {sleep_time:.2f} seconds for next request")
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Rate limiter: Waiting {sleep_time:.2f} seconds")
+                await asyncio.sleep(sleep_time)
+        self.timestamps.append(time.time())
+
+# 全局 Polygon API 速率限制器：每 60 秒 5 次
+polygon_rate_limiter = RateLimiter(calls=5, period=60.0)
+
+async def fetch_sentiment_data(date: str, db_path: str, config: dict) -&gt; pd.DataFrame:
+    """從 X API 獲取推文並儲存到 SQLite 的 tweets 表。"""
+    try:
+        end_date = pd.to_datetime(date)
+        start_date = end_date - timedelta(days=1)
+        cache_key = f"tweets_{end_date.strftime('%Y-%m-%d')}"
+        redis_client = get_redis_client(config)
+        
+        # 檢查 Redis 快取
+        if redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    logging.info(f"從 Redis 快取載入推文數據: {cache_key}")
+                    return pd.read_json(cached)
+            except redis.RedisError as e:
+                logging.warning(f"Redis 快取查詢失敗: {str(e)}")
+        
+        # X API 請求
+        start_time = start_date.strftime('%Y-%m-%dT00:00:00Z')
+        end_time = end_date.strftime('%Y-%m-%dT23:59:59Z')
+        X_BEARER_TOKEN = config['api_key'].get('x_bearer_token', '')
+        if not X_BEARER_TOKEN:
+            logging.error("X Bearer Token 未配置")
+            return pd.DataFrame()
+        
+        url = "https://api.x.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
+        params = {'query': "(USDJPY OR USD/JPY OR 'Federal Reserve') lang:en", 'start_time': start_time, 'end_time': end_time, 'max_results': 100}
+        data = await fetch_api_data(url, headers=headers, params=params)
+        
+        if 'data' not in data or not data['data']:
+            logging.warning(f"X API 數據為空或格式錯誤: {data}")
+            return pd.DataFrame()
+        
+        # 構建推文數據
+        tweets = [
+            {'date': end_date, 'tweet_id': tweet['id'], 'text': tweet['text']}
+            for tweet in data['data']
+        ]
+        tweets_df = pd.DataFrame(tweets)
+        # 儲存結果
+        if not tweets_df.empty:
+            if redis_client:
+                try:
+                    redis_client.setex(cache_key, 24 * 3600, tweets_df.to_json())
+                    logging.info(f"已快取推文數據至 Redis: {cache_key}")
+                except redis.RedisError as e:
+                    logging.warning(f"無法快取至 Redis: {str(e)}")
+            await save_data(tweets_df, timeframe='1 day', db_path=db_path, data_type='tweets')
+            logging.info(f"儲存 {len(tweets_df)} 條推文到 SQLite")
+        else:
+            logging.warning("無推文數據")
+        
+        return tweets_df
+    except Exception as e:
+        logging.error(f"推文數據獲取錯誤: {str(e)}, traceback={traceback.format_exc()}")
+        return pd.DataFrame()
+
+async def fetch_data(primary_api: str = 'polygon', backup_apis: list = ['yfinance', 'fcs', 'fixer'], date_range: dict = None, timeframe: str = '1d', db_path: str = "C:\\Trading\\data\\trading_data.db", config: dict = None) -&gt; pd.DataFrame:
+    """獲取資料：支援多 API，優先使用 primary，失敗則備用。使用 Redis 和 SQLite 快取減少呼叫，加入缺失值填補。"""
+    def normalize_timeframe(tf: str) -&gt; str:
+        mapping = {'1 hour': '1h', '4 hours': '4h', '1 day': '1d'}
+        return mapping.get(tf, tf)
+    timeframe = normalize_timeframe(timeframe)
+    use_redis = config.get('system_config', {}).get('use_redis', True)
+    
+    redis_client = get_redis_client(config)
+    key = f'usd_jpy_data_{timeframe}'
+    start_date = pd.to_datetime(date_range['start'] if date_range else "2025-01-01")
+    end_date = pd.to_datetime(date_range['end'] if date_range else "2025-08-25")
+    CSV_PATH = Path(config['system_config']['root_dir']) / 'data' / f'usd_jpy_{timeframe}.csv'
+    # 定義時間框架映射和各 API 的參數
+    interval_map = {
+        '1min': {'multiplier': 1, 'timespan': 'minute', 'yfinance': '1m', 'fcs': '1min', 'fixer': None},
+        '5min': {'multiplier': 5, 'timespan': 'minute', 'yfinance': '5m', 'fcs': '5min', 'fixer': None},
+        '1h': {'multiplier': 1, 'timespan': 'hour', 'yfinance': '1h', 'fcs': '1hour', 'fixer': None},
+        '4h': {'multiplier': 4, 'timespan': 'hour', 'yfinance': '4h', 'fcs': '4hour', 'fixer': None},
+        '1d': {'multiplier': 1, 'timespan': 'day', 'yfinance': '1d', 'fcs': '1day', 'fixer': '1d'}
+    }
+    if timeframe not in interval_map:
+        logging.error(f"無效的時間框架: {timeframe}")
+        return pd.DataFrame()
+    interval = interval_map[timeframe]
+    # 第一層快取：Redis
+    if use_redis and redis_client:
+        try:
+            cached = redis_client.get(key)
+            if cached:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 Redis 快取載入資料")
+                logging.info(f"Loaded data from Redis cache: key={key}, timeframe={timeframe}")
+                df = pd.read_json(cached)
+                df = fill_missing_values(df)
+                return df[['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']]
+        except redis.RedisError as e:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Redis 快取查詢失敗：{str(e)}")
+            logging.warning(f"Redis cache query failed: {str(e)}, timeframe={timeframe}, falling back to SQLite", extra={'mode': 'fetch_data'})
+    # 第二層快取：SQLite
+    await initialize_db(db_path)
+    try:
+        async with aiosqlite.connect(db_path, timeout=10) as conn:
+            cursor = await conn.execute("SELECT * FROM ohlc WHERE timeframe = ? AND date BETWEEN ? AND ?",
+                                     (timeframe, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(rows, columns=columns)
+            await cursor.close()
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df = filter_future_dates(df)
+                df = fill_missing_values(df)
+                # 防護：如果缺少 'n' 或 'vw'，手動設定
+                if 'n' not in df.columns:
+                    df['n'] = 0
+                if 'vw' not in df.columns:
+                    df['vw'] = df['close']
+                if use_redis and redis_client:
+                    try:
+                        redis_client.setex(key, 3600, df.to_json())
+                        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將 SQLite 數據快取至 Redis")
+                        logging.info(f"Cached SQLite data to Redis: key={key}, timeframe={timeframe}")
+                    except redis.RedisError as e:
+                        logging.warning(f"無法快取至 Redis: {str(e)}")
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 SQLite 快取載入資料：{timeframe}")
+                logging.info(f"Loaded data from SQLite: shape={df.shape}, timeframe={timeframe}")
+                return df[['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']]
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} SQLite 快取查詢失敗：{str(e)}")
+        logging.error(f"SQLite cache query failed: {str(e)}, timeframe={timeframe}, traceback={traceback.format_exc()}")
+    # API 呼叫：分批獲取
+    apis = [primary_api] + backup_apis
+    df_list = []
+    for api in apis:
+        # 檢查 API 是否支持指定的 timeframe
+        if api == 'fixer' and interval['fixer'] is None:
+            logging.warning(f"Fixer API 不支持 {timeframe} 時間框架，跳過")
+            continue
+        proxies = get_proxy(config)
+        if not await test_proxy(proxies):
+            logging.warning(f"代理不可用，無代理模式")
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 代理不可用，無代理模式")
+        current_start = start_date
+        while current_start &lt; end_date:
+            # 根據 timespan 動態設置分批範圍
+            if interval['timespan'] == 'minute':
+                batch_end = current_start + timedelta(days=7) # 分鐘級數據分批較小
+            elif interval['timespan'] == 'hour':
+                batch_end = current_start + timedelta(days=30) # 小時級數據
+            else: # day
+                batch_end = current_start + timedelta(days=365) # 天級數據
+            batch_end = min(batch_end, end_date)
+            batch_range = {'start': current_start.strftime('%Y-%m-%d'), 'end': batch_end.strftime('%Y-%m-%d')}
+            # 檢查 yfinance 的時間範圍限制
+            if api == 'yfinance':
+                delta = batch_end - current_start
+                if timeframe == '1min' and delta &gt; timedelta(days=7):
+                    logging.warning(f"yfinance 不支持 {timeframe} 超過 7 天，跳過此批次")
+                    current_start = batch_end
+                    continue
+                if timeframe == '5min' and delta &gt; timedelta(days=60):
+                    logging.warning(f"yfinance 不支持 {timeframe} 超過 60 天，跳過此批次")
+                    current_start = batch_end
+                    continue
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 分批提取 {api}：{batch_range['start']} 至 {batch_range['end']}")
+                logging.info(f"Batch fetch from {api}: {batch_range['start']} to {batch_range['end']}, timeframe={timeframe}")
+                try:
+                    for attempt in range(5):
+                        try:
+                            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 提取{api}")
+                            ticker = yf.Ticker('USDJPY=X')
+                            df = ticker.history(start=batch_range['start'], end=batch_range['end'], interval=interval['yfinance'])
+                            if df.empty:
+                                logging.warning(f"Yahoo Finance batch empty: timeframe={timeframe}")
+                                break
+                            df = df.reset_index().rename(columns={'Date': 'date', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+                            df['date'] = pd.to_datetime(df['date'])
+                            df['n'] = 0 # yfinance 不提供交易次數
+                            df['vw'] = df['close'] # 模擬成交量加權平均價格
+                            df = fill_missing_values(df)
+                            df_list.append(df[['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']])
+                            logging.info(f"yfinance data fetched: shape={df.shape}, timeframe={timeframe}")
+                            break
+                        except Exception as e:
+                            if attempt == 4:
+                                logging.error(f"Yahoo Finance batch failed: {str(e)}, timeframe={timeframe}, traceback={traceback.format_exc()}")
+                                break
+                            await asyncio.sleep(2 ** attempt * 4)
+                except Exception as e:
+                    logging.error(f"{api} API batch failed: {str(e)}, timeframe={timeframe}, traceback={traceback.format_exc()}")
+                    continue
+            elif api == 'polygon':
+                # 根據 polygon 及 timespan 限制動態設置分批範圍
+                if interval['timespan'] == 'minute':
+                    batch_end = current_start + timedelta(days=30) # 分鐘級數據分批較小
+                elif interval['timespan'] == 'hour':
+                    batch_end = current_start + timedelta(days=730) # 小時級數據
+                else: # day
+                    batch_end = current_start + timedelta(days=730) # 天級數據
+                batch_end = min(batch_end, end_date)
+                batch_range = {'start': current_start.strftime('%Y-%m-%d'), 'end': batch_end.strftime('%Y-%m-%d')}
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 提取{api}")
+                api_key = config['api_key'].get('polygon_api_key', '')
+                if not api_key:
+                    logging.error("Polygon API key not configured")
+                    continue
+                # 計算預期數據點數以設置 limit
+                delta = batch_end - current_start
+                limit = 50000
+                url = f"https://api.polygon.io/v2/aggs/ticker/C:USDJPY/range/{interval['multiplier']}/{interval['timespan']}/{batch_range['start']}/{batch_range['end']}?adjusted=true&amp;sort=asc&amp;limit={limit}&amp;apiKey={api_key}"
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 提取{api}: {url}")
+                logging.info(f"Attempting Polygon API request: {url}, timeframe={timeframe}")
+
+                # 分頁處理：循環請求直到沒有 next_url
+                page_count = 0
+                batch_results = []  # 收集本批次的 results
+                while url:
+                    page_count += 1
+                    for attempt in range(3):  # 重試 3 次
+                        await polygon_rate_limiter.wait()  # 等待速率限制器
+                        async with aiohttp.ClientSession() as session:
+                            try:
+                                async with session.get(url, timeout=10) as response:
+                                    data = await response.json()
+                                    if data.get('status') not in ['OK', 'DELAYED']:
+                                        logging.warning(f"Polygon API failed: status={data.get('status')}, message={data.get('error', 'Unknown error')}, timeframe={timeframe}")
+                                        break
+                                    if data.get('ticker') != 'C:USDJPY':
+                                        logging.warning(f"Polygon API returned unexpected ticker: {data.get('ticker')}, timeframe={timeframe}")
+                                        break
+                                    if 'results' not in data or not data['results']:
+                                        logging.warning(f"Polygon API batch empty: timeframe={timeframe}")
+                                        break
+                                    logging.info(f"Polygon API page {page_count}: queryCount={data.get('queryCount', 0)}, resultsCount={data.get('resultsCount', 0)}, request_id={data.get('request_id', 'N/A')}, timeframe={timeframe}")
+                                    batch_results.extend(data['results'])
+                                    # 檢查 next_url，如果存在，附加 apiKey
+                                    next_url = data.get('next_url')
+                                    if next_url:
+                                        url = f"{next_url}&amp;apiKey={api_key}"
+                                        logging.info(f"Fetching next page: {url}")
+                                    else:
+                                        url = None
+                                    break  # 成功後跳出重試
+                            except Exception as e:
+                                logging.warning(f"Polygon request failed on attempt {attempt+1}: {str(e)}")
+                                if attempt == 2:
+                                    url = None  # 失敗後停止
+                                await asyncio.sleep(2 ** attempt * 2)
+
+                # 處理收集的 results
+                if batch_results:
+                    df_batch = pd.DataFrame(batch_results)[['t', 'o', 'h', 'l', 'c', 'v', 'n', 'vw']].rename(
+                        columns={'t': 'date', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume', 'n': 'n', 'vw': 'vw'}
+                    )
+                    df_batch['date'] = pd.to_datetime(df_batch['date'], unit='ms')
+                    df_batch = fill_missing_values(df_batch)
+                    df_list.append(df_batch)
+                    logging.info(f"Polygon data fetched (all pages): shape={df_batch.shape}, pages={page_count}, timeframe={timeframe}")
+                else:
+                    logging.warning(f"No results from Polygon for batch: {batch_range['start']} to {batch_range['end']}")
+
+            elif api == 'fcs':
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 提取{api}")
+                api_key = config['api_key'].get('fcs_api_key', '')
+                if not api_key:
+                    logging.error("FCS API key not configured")
+                    continue
+                url = f"https://fcsapi.com/api-v3/forex/history?symbol=USD/JPY&amp;access_key={api_key}&amp;period={interval['fcs']}&amp;from={batch_range['start']}&amp;to={batch_range['end']}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=10) as response:
+                        data = await response.json()
+                        if 'response' not in data or not data['response']:
+                            logging.warning(f"FCS API batch empty: timeframe={timeframe}")
+                            continue
+                        if data.get('code') != 200:
+                            logging.warning(f"FCS API failed: code={data.get('code')}, message={data.get('msg', 'Unknown error')}")
+                            continue
+                        df = pd.DataFrame(data['response'])[['datetime', 'open', 'high', 'low', 'close', 'volume']].rename(columns={'datetime': 'date'})
+                        df['date'] = pd.to_datetime(df['date'])
+                        df['n'] = 0 # FCS 不提供交易次數
+                        df['vw'] = df['close'] # 模擬成交量加權平均價格
+                        df = fill_missing_values(df)
+                        df_list.append(df)
+                        logging.info(f"FCS data fetched: shape={df.shape}, timeframe={timeframe}")
+            elif api == 'fixer':
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 提取{api}")
+                api_key = config['api_key'].get('fixer_API_Key', '')
+                if not api_key:
+                    logging.error("Fixer API key not configured")
+                    continue
+                url = f"http://data.fixer.io/api/timeseries?access_key={api_key}&amp;start_date={batch_range['start']}&amp;end_date={batch_range['end']}&amp;symbols=USD,JPY"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=10) as response:
+                        data = await response.json()
+                        if not data.get('success') or 'rates' not in data:
+                            logging.warning(f"Fixer API batch empty or failed: timeframe={timeframe}")
+                            continue
+                        rates = data['rates']
+                        df_data = []
+                        for date, rate in rates.items():
+                            if 'USD' in rate and 'JPY' in rate:
+                                usd_jpy = rate['JPY'] / rate['USD']
+                                df_data.append({'date': date, 'close': usd_jpy, 'open': usd_jpy, 'high': usd_jpy, 'low': usd_jpy, 'volume': 0, 'n': 0, 'vw': usd_jpy})
+                        df = pd.DataFrame(df_data)
+                        df['date'] = pd.to_datetime(df['date'])
+                        df = fill_missing_values(df)
+                        df_list.append(df[['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']])
+                        logging.info(f"Fixer data fetched: shape={df.shape}, timeframe={timeframe}")
+            current_start = batch_end
+        if df_list:
+            df = pd.concat(df_list, ignore_index=True).drop_duplicates(subset=['date'])
+            df = filter_future_dates(df)
+            df = fill_missing_values(df)
+            await save_data(df, timeframe, db_path, data_type='ohlc')
+            if not os.path.exists(CSV_PATH.parent):
+                os.makedirs(CSV_PATH.parent)
+            df.to_csv(CSV_PATH, index=False)
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} OHLC 數據已儲存到 CSV：{CSV_PATH}")
+            if use_redis and redis_client:
+                try:
+                    redis_client.setex(key, 3600, df.to_json())
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將 API 數據快取至 Redis")
+                    logging.info(f"Cached API data to Redis: key={key}, timeframe={timeframe}")
+                except redis.RedisError as e:
+                    logging.warning(f"無法快取至 Redis: {str(e)}")
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 {api} 獲取資料成功")
+            logging.info(f"Successfully fetched data from {api}: shape={df.shape}, timeframe={timeframe}")
+            return df[['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']]
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 所有 API 和 CSV 後備失敗")
+    logging.error(f"All APIs and CSV fallback failed, timeframe={timeframe}")
+    return pd.DataFrame()
+def fill_missing_values(df: pd.DataFrame) -&gt; pd.DataFrame:
+    """填補缺失值：使用前向填補法，確保數據連續性。"""
+    if df.empty:
+        return df
+    numeric_columns = ['open', 'high', 'low', 'close', 'volume', 'n', 'vw']
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
+            if df[col].isna().all():
+                df[col] = df[col].fillna(0)  # 若全為 NaN，使用 0 作為預設值
+    if 'fed_funds_rate' in df.columns:
+        df['fed_funds_rate'] = df['fed_funds_rate'].fillna(method='ffill').fillna(method='bfill')
+        if df['fed_funds_rate'].isna().all():
+            df['fed_funds_rate'] = df['fed_funds_rate'].fillna(0)  # 聯邦基金利率預設為 0
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已填補缺失值")
+    logging.info("Missing values filled using forward and backward fill")
+    return df
+async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, config: dict = None) -&gt; pd.DataFrame:
+    """計算技術指標：使用多線程計算 RSI, MACD, ATR, Stochastic, ADX, Ichimoku, Bollinger, EMA，支援分批計算並檢查重複。"""
+    try:
+        # 動態數據長度檢查，根據時間框架設置最小數據長度
+        min_data_length = {'1min': 200, '5min': 150, '1h': 100, '4h': 60, '1d': 60}
+        required_length = min_data_length.get(timeframe, 100)
+        if len(df) &lt; required_length:
+            logging.warning(f"數據長度不足 ({len(df)} &lt; {required_length}) for timeframe {timeframe}，跳過指標計算")
+            return df
+
+        # 檢查 SQLite 是否已存儲最新指標
+        async with aiosqlite.connect(db_path, timeout=10) as conn:
+            cursor = await conn.execute(
+                "SELECT MAX(date) FROM indicators WHERE timeframe = ? AND indicator IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (timeframe, 'RSI', 'MACD', 'ATR', 'Stoch_k', 'ADX', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'BB_upper', 'EMA_12', 'EMA_26')
+            )
+            last_date = await cursor.fetchone()
+            last_date = pd.to_datetime(last_date[0]) if last_date[0] else None
+            if last_date and df['date'].max() &lt;= last_date:
+                logging.info(f"發現最新指標已存儲 for timeframe {timeframe}，從 SQLite 載入")
+                cursor = await conn.execute(
+                    "SELECT date, indicator, value FROM indicators WHERE timeframe = ? AND date &gt;= ?",
+                    (timeframe, df['date'].min().strftime('%Y-%m-%d'))
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    indicators_df = pd.DataFrame(rows, columns=['date', 'indicator', 'value'])
+                    indicators_df = indicators_df.pivot(index='date', columns='indicator', values='value')
+                    indicators_df['date'] = pd.to_datetime(indicators_df['date'])
+                    df = df.merge(indicators_df, on='date', how='left')
+                    df = fill_missing_values(df)
+                    return df
+
+        # 分批計算（若數據量大）
+        batch_size = 10000 if timeframe in ['1min', '5min'] else None
+        if batch_size and len(df) &gt; batch_size:
+            logging.info(f"數據量大 ({len(df)})，分批計算，batch_size={batch_size}")
+            df_list = [df[i:i+batch_size] for i in range(0, len(df), batch_size)]
+        else:
+            df_list = [df]
+
+        from concurrent.futures import ThreadPoolExecutor                                                
+        result_dfs = []
+        for batch_df in df_list:
+            def calc_rsi(df):
+                rsi = ta.rsi(df['close'], length=14)
+                return rsi if rsi is not None else pd.Series(np.nan, index=df.index, name='RSI')
+
+            def calc_macd(df):
+                macd = ta.macd(df['close'])
+                if macd is None:
+                    return pd.DataFrame({'MACD': np.nan, 'MACD_signal': np.nan, 'MACD_hist': np.nan}, index=df.index)
+                return macd[['MACD_12_26_9', 'MACDs_12_26_9', 'MACDh_12_26_9']].rename(
+                    columns={'MACD_12_26_9': 'MACD', 'MACDs_12_26_9': 'MACD_signal', 'MACDh_12_26_9': 'MACD_hist'}
+                )
+
+            def calc_atr(df):
+                atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+                return atr if atr is not None else pd.Series(np.nan, index=df.index, name='ATR')
+
+            def calc_stoch(df):
+                stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
+                if stoch is None:
+                    return pd.Series(np.nan, index=df.index, name='Stoch_k')
+                return stoch['STOCHk_14_3_3']
+
+            def calc_adx(df):
+                adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+                if adx is None:
+                    return pd.Series(np.nan, index=df.index, name='ADX')
+                return adx['ADX_14']
+
+            def calc_ichimoku(df):
+                if not all(col in df.columns for col in ['high', 'low', 'close']):
+                    logging.warning(f"Missing required columns for Ichimoku calculation: {df.columns.tolist()}")
+                    return pd.DataFrame({
+                        'Ichimoku_tenkan': np.nan, 'Ichimoku_kijun': np.nan, 'Ichimoku_span_a': np.nan, 'Ichimoku_span_b': np.nan
+                    }, index=df.index)
+                if df[['high', 'low', 'close']].isna().any().any():
+                    logging.warning(f"NaN values detected in high, low, or close columns for timeframe {timeframe}")
+                    df = df.fillna(method='ffill').fillna(method='bfill')
+                ich = ta.ichimoku(df['high'], df['low'], df['close'], tenkan=9, kijun=26, senkou=52)
+                if ich[0] is None:
+                    logging.warning(f"Ichimoku calculation returned None for timeframe {timeframe}")
+                    return pd.DataFrame({
+                        'Ichimoku_tenkan': np.nan, 'Ichimoku_kijun': np.nan, 'Ichimoku_span_a': np.nan, 'Ichimoku_span_b': np.nan
+                    }, index=df.index)
+                try:
+                    # Replace with actual column names from debug output
+                    return ich[0][['ISA_9', 'ISB_26', 'ITS_9', 'IKS_26']].rename(
+                        columns={
+                            'ITS_9': 'Ichimoku_tenkan',
+                            'IKS_26': 'Ichimoku_kijun',
+                            'ISA_9': 'Ichimoku_span_a',
+                            'ISB_26': 'Ichimoku_span_b'
+                        }
+                    )
+                except KeyError as e:
+                    logging.error(f"Ichimoku column error: {str(e)}, timeframe={timeframe}")
+                    return pd.DataFrame({
+                        'Ichimoku_tenkan': np.nan, 'Ichimoku_kijun': np.nan, 'Ichimoku_span_a': np.nan, 'Ichimoku_span_b': np.nan
+                    }, index=df.index)
+
+            def calc_bbands(df):
+                bb = ta.bbands(df['close'], length=20, std=2)
+                if bb is None:
+                    return pd.DataFrame({'BB_upper': np.nan, 'BB_middle': np.nan, 'BB_lower': np.nan}, index=df.index)
+                return bb[['BBU_20_2.0', 'BBM_20_2.0', 'BBL_20_2.0']].rename(
+                    columns={'BBU_20_2.0': 'BB_upper', 'BBM_20_2.0': 'BB_middle', 'BBL_20_2.0': 'BB_lower'}
+                )
+
+            def calc_ema_12(df):
+                ema = ta.ema(df['close'], length=12)
+                return ema if ema is not None else pd.Series(np.nan, index=df.index, name='EMA_12')
+
+            def calc_ema_26(df):
+                ema = ta.ema(df['close'], length=26)
+                return ema if ema is not None else pd.Series(np.nan, index=df.index, name='EMA_26')
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(calc_rsi, batch_df),
+                    executor.submit(calc_macd, batch_df),
+                    executor.submit(calc_atr, batch_df),
+                    executor.submit(calc_stoch, batch_df),
+                    executor.submit(calc_adx, batch_df),
+                    executor.submit(calc_ichimoku, batch_df),
+                    executor.submit(calc_bbands, batch_df),
+                    executor.submit(calc_ema_12, batch_df),
+                    executor.submit(calc_ema_26, batch_df)
+                ]
+                results = [f.result() for f in futures]
+
+            batch_df = batch_df.copy()
+            batch_df['RSI'] = results[0]
+            batch_df[['MACD', 'MACD_signal', 'MACD_hist']] = results[1]
+            batch_df['ATR'] = results[2]
+            batch_df['Stoch_k'] = results[3]
+            batch_df['ADX'] = results[4]
+            batch_df[['Ichimoku_tenkan', 'Ichimoku_kijun', 'Ichimoku_span_a', 'Ichimoku_span_b']] = results[5]
+            batch_df['Ichimoku_cloud_top'] = results[5][['Ichimoku_span_a', 'Ichimoku_span_b']].max(axis=1)
+            batch_df[['BB_upper', 'BB_middle', 'BB_lower']] = results[6]
+            batch_df['EMA_12'] = results[7]
+            batch_df['EMA_26'] = results[8]
+
+            # 改進缺失值處理：前向填補代替 dropna
+            batch_df = fill_missing_values(batch_df)
+            result_dfs.append(batch_df)
+
+        df = pd.concat(result_dfs, ignore_index=True).drop_duplicates(subset=['date'])
+
+        # 存入 DB
+        await save_data(df, timeframe, db_path, data_type='indicators')
+        logging.info(f"指標數據已存入 DB: timeframe={timeframe}")
+
+        # 存入 CSV
+        if config:
+            indicators_csv_path = Path(config['system_config']['root_dir']) / 'data' / f'usd_jpy_{timeframe}_indicators.csv'
+            if not os.path.exists(indicators_csv_path.parent):
+                os.makedirs(indicators_csv_path.parent)
+            df.to_csv(indicators_csv_path, index=False)
+            logging.info(f"指標數據已存入 CSV: {indicators_csv_path}")
+
+        return df
+    except Exception as e:
+        logging.error(f"指標計算錯誤: {str(e)}, timeframe={timeframe}, traceback={traceback.format_exc()}")
+        return df
+async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) -&gt; pd.DataFrame:
+    """獲取經濟日曆數據並儲存到 SQLite，新增 FRED API 獲取聯邦基金利率。"""
+    use_redis = config.get('system_config', {}).get('use_redis', True)
+   
+    redis_client = get_redis_client(config)
+    key = 'usd_jpy_economic_calendar'
+    CSV_PATH = Path(config['system_config']['root_dir']) / 'data' / 'economic_calendar.csv'
+    start_date = pd.to_datetime(date_range['start']) - timedelta(days=7)
+    end_date = pd.to_datetime(date_range['end']) + timedelta(days=7)
+    # 第一層快取：Redis
+    if use_redis and redis_client:
+        try:
+            cached = redis_client.get(key)
+            if cached:
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 Redis 快取載入經濟日曆數據")
+                logging.info(f"Loaded economic calendar from Redis cache: key={key}")
+                df = pd.read_json(cached)
+                df['date'] = pd.to_datetime(df['date'])
+                df = fill_missing_values(df)
+                return df[['date', 'event', 'impact', 'fed_funds_rate']]
+        except redis.RedisError as e:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Redis 快取查詢失敗：{str(e)}")
+            logging.warning(f"Redis cache query failed: {str(e)}, falling back to SQLite", extra={'mode': 'fetch_economic_calendar'})
+    # 第二層快取：SQLite
+    try:
+        async with aiosqlite.connect(db_path, timeout=10) as conn:
+            cursor = await conn.execute("SELECT * FROM economic_calendar WHERE date BETWEEN ? AND ?",
+                                     (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(rows, columns=columns)
+            await cursor.close()
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df = filter_future_dates(df)
+                df = fill_missing_values(df)
+                if use_redis and redis_client:
+                    try:
+                        redis_client.setex(key, 3600, df.to_json())
+                        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將 SQLite 數據快取至 Redis")
+                        logging.info(f"Cached SQLite data to Redis: key={key}")
+                    except redis.RedisError as e:
+                        logging.warning(f"無法快取至 Redis: {str(e)}")
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 SQLite 載入經濟日曆數據")
+                logging.info(f"Loaded economic calendar from SQLite: shape={df.shape}")
+                return df[['date', 'event', 'impact', 'fed_funds_rate']]
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} SQLite 經濟日曆查詢失敗：{str(e)}")
+        logging.error(f"SQLite economic calendar query failed: {str(e)}, traceback={traceback.format_exc()}")
+    # 使用 investpy 獲取經濟日曆數據
+    try:
+        proxies = get_proxy(config)
+        if not await test_proxy(proxies):
+            logging.warning("主代理不可用，嘗試備用代理")
+            for backup_proxy in config.get('system_config', {}).get('backup_proxies', []):
+                if await test_proxy(backup_proxy):
+                    proxies = backup_proxy
+                    break
+            else:
+                proxies = {}
+                logging.warning("所有代理不可用，無代理模式")
+        importances = ['high', 'medium']
+        time_zone = 'GMT +8:00'
+        from_date = start_date.strftime('%d/%m/%Y')
+        to_date = end_date.strftime('%d/%m/%Y')
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 正在從 investpy 獲取經濟日曆數據：{from_date} 至 {to_date}")
+        logging.info(f"Fetching economic calendar from investpy: start={from_date}, end={to_date}")
+        calendar = investpy.economic_calendar(
+            importances=importances,
+            time_zone=time_zone,
+            from_date=from_date,
+            to_date=to_date,
+            countries=['united states', 'japan']
+        )
+        if calendar.empty:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} investpy 經濟日曆數據為空")
+            logging.warning("investpy economic calendar data is empty")
+            df = pd.DataFrame()
+        else:
+            calendar['date'] = pd.to_datetime(calendar['date'], format='%d/%m/%Y')
+            calendar = calendar[calendar['importance'].notnull()]
+            calendar['event'] = calendar['currency'] + ' ' + calendar['event']
+            calendar['impact'] = calendar['importance'].str.capitalize()
+            df = calendar[['date', 'event', 'impact']]
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} investpy 經濟日曆數據獲取失敗：{str(e)}")
+        logging.error(f"Failed to fetch investpy economic calendar: {str(e)}, traceback={traceback.format_exc()}")
+        df = pd.DataFrame()
+    # 使用 FRED API 獲取聯邦基金利率
+    try:
+        fred_api_key = config['api_key'].get('fred_api_key', '')
+        if not fred_api_key:
+            logging.error("FRED API key not configured")
+        else:
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&amp;api_key={fred_api_key}&amp;file_type=json&amp;observation_start={start_date.strftime('%Y-%m-%d')}&amp;observation_end={end_date.strftime('%Y-%m-%d')}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    data = await response.json()
+                    if 'observations' not in data:
+                        logging.warning("FRED API returned no observations")
+                    else:
+                        fred_data = pd.DataFrame(data['observations'])[['date', 'value']].rename(columns={'value': 'fed_funds_rate'})
+                        fred_data['date'] = pd.to_datetime(fred_data['date'])
+                        fred_data['fed_funds_rate'] = fred_data['fed_funds_rate'].astype(float)
+                        if not df.empty:
+                            df = df.merge(fred_data[['date', 'fed_funds_rate']], on='date', how='left')
+                        else:
+                            df = fred_data[['date', 'fed_funds_rate']]
+                            df['event'] = 'FEDFUNDS'
+                            df['impact'] = 'High'
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} FRED API 獲取失敗：{str(e)}")
+        logging.error(f"Failed to fetch FRED API data: {str(e)}, traceback={traceback.format_exc()}")
+    # 儲存數據前去重，防止UNIQUE constraint failed
+    if not df.empty:
+        df = df.drop_duplicates(subset=['date', 'event'], keep='last')  # 去重，保留最後一筆
+        df = filter_future_dates(df)
+        df = fill_missing_values(df)
+        await save_data(df, timeframe='1 day', db_path=db_path, data_type='economic')
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 經濟日曆數據已儲存到 SQLite")
+        logging.info(f"Economic calendar data saved to SQLite: shape={df.shape}")
+        if not os.path.exists(CSV_PATH.parent):
+            os.makedirs(CSV_PATH.parent)
+        df.to_csv(CSV_PATH, index=False)
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 經濟日曆數據已儲存到 CSV：{CSV_PATH}")
+        logging.info(f"Economic calendar data saved to CSV: {CSV_PATH}")
+        if use_redis and redis_client:
+            try:
+                redis_client.setex(key, 3600, df.to_json())
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將經濟日曆數據快取至 Redis")
+                logging.info(f"Cached economic calendar data to Redis: key={key}")
+            except redis.RedisError as e:
+                logging.warning(f"無法快取至 Redis: {str(e)}")
+        return df[['date', 'event', 'impact', 'fed_funds_rate']]
+    # 從 CSV 載入備份
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 無 investpy/FRED 數據，嘗試從 CSV 載入")
+    logging.info("No investpy/FRED data, trying to load from CSV")
+    if CSV_PATH.exists():
+        df = pd.read_csv(CSV_PATH)
+        required_columns = ['date', 'event', 'impact']
+        if all(col in df.columns for col in required_columns):
+            df['date'] = pd.to_datetime(df['date'])
+            df = df[(df['date'] &gt;= start_date) &amp; (df['date'] &lt;= end_date)]
+            df = df.drop_duplicates(subset=['date', 'event'], keep='last')  # 去重
+            df = filter_future_dates(df)
+            df = fill_missing_values(df)
+            await save_data(df, timeframe='1 day', db_path=db_path, data_type='economic')
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從 CSV 載入經濟日曆數據並儲存到 SQLite")
+            logging.info(f"Loaded and saved economic calendar from CSV: shape={df.shape}")
+            if use_redis and redis_client:
+                try:
+                    redis_client.setex(key, 3600, df.to_json())
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已將 CSV 數據快取至 Redis")
+                    logging.info(f"Cached CSV data to Redis: key={key}")
+                except redis.RedisError as e:
+                    logging.warning(f"無法快取至 Redis: {str(e)}")
+            return df[['date', 'event', 'impact', 'fed_funds_rate']]
+        else:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CSV 檔案缺少必要欄位：{required_columns}")
+            logging.warning(f"Invalid or missing columns in {CSV_PATH}, columns={df.columns.tolist()}")
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 警告：經濟日曆數據為空")
+    logging.warning("Economic calendar is empty")
+    return pd.DataFrame()</code></pre>
+
+    <h2>.\main.py</h2>
+    <pre><code>import asyncio
+import logging
+import logging.handlers
+import pandas as pd
+import torch
+import json
+import os
+import time
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from data_acquisition import fetch_data, compute_indicators, fetch_economic_calendar
+from ai_models import update_model, predict_sentiment, integrate_sentiment
+from trading_strategy import ForexEnv, train_ppo, make_decision, backtest, connect_ib, execute_trade
+from risk_management import calculate_stop_loss, calculate_take_profit, calculate_position_size, predict_volatility
+from utils import check_hardware, setup_proxy, check_volatility, save_data, save_periodically, initialize_db, load_settings, decrypt_key
+import streamlit as st
+from prometheus_client import Counter, Histogram
+from pathlib import Path
+# Prometheus 指標，用於監控交易次數和 API 延遲
+trade_counter = Counter('usd_jpy_trades_total', 'Total number of trades executed', ['action', 'mode'])
+api_latency = Histogram('usd_jpy_api_latency_seconds', 'API call latency', ['mode'])
+# 結構化 JSON 日誌格式，方便後續分析
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'level': record.levelname,
+            'message': record.getMessage(),
+            'module': record.module,
+            'filename': record.filename,
+            'funcName': record.funcName,
+            'mode': getattr(record, 'mode', 'unknown')
+        }
+        return json.dumps(log_data, ensure_ascii=False)
+# 配置日誌，區分回測和實時模式
+def setup_logging(mode: str):
+    """設置日誌：根據模式（回測/實時）創建不同的日誌檔案，並使用 JSON 格式。
+    邏輯：每天輪替日誌檔案，保留 7 天備份，確保日誌結構化且易於解析。
+    """
+    log_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path('logs')
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f'app_{mode}_{log_time}.log'
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    handler = logging.handlers.TimedRotatingFileHandler(log_file, when='midnight', backupCount=7)
+    handler.setFormatter(JsonFormatter())
+    logger.handlers = [handler]
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 日誌設定完成")
+    logging.info(f"Logging setup completed for mode: {mode}", extra={'mode': mode})
+# 清理舊備份檔案
+def clean_old_backups(root_dir: str, days_to_keep: int = 7):
+    """清理舊備份檔案：僅保留指定天數的資料庫備份檔案。
+    邏輯：遍歷備份目錄，刪除早於指定天數的檔案，確保磁碟空間不被過度佔用。
+    """
+    backup_dir = Path(root_dir) / 'backups'
+    if not backup_dir.exists():
+        return
+    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+    for backup_file in backup_dir.glob('trading_data_*.db'):
+        file_date = datetime.strptime(backup_file.stem.split('_')[-1], '%Y%m%d')
+        if file_date &lt; cutoff_date:
+            backup_file.unlink()
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 舊備份已刪除")
+            logging.info(f"Deleted old backup file: {backup_file}", extra={'mode': 'cleanup'})
+# 載入配置檔並設置環境變數
+def load_config():
+    """載入配置檔：從環境變數和 JSON 檔案載入配置，確保安全性。
+    邏輯：優先從環境變數載入加密密鑰，然後解密 API 密鑰，確保敏感資訊不硬編碼。
+    """
+    load_dotenv()
+    config = load_settings()
+    api_key = config.get('api_key', {})
+    for k in api_key:
+        if isinstance(api_key[k], bytes):
+            api_key[k] = decrypt_key(api_key[k])
+    system_config = config.get('system_config', {})
+    trading_params = config.get('trading_params', {})
+    fernet_key = api_key.get('FERNET_KEY', '')
+    if not fernet_key:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 環境變數未設置")
+        logging.error("FERNET_KEY environment variable not set", extra={'mode': 'config'})
+        raise ValueError("FERNET_KEY environment variable not set")
+    return config, api_key, system_config, trading_params
+async def main(mode: str = 'backtest'):
+    """主程式入口：協調資料獲取、模型訓練、交易決策和風險管理。
+    參數：
+        mode: 'backtest' 或 'live'，決定運行回測或實時交易模式。
+    邏輯：
+        1. 設置日誌和代理，初始化資料庫。
+        2. 獲取多時間框架資料和經濟日曆。
+        3. 檢查波動性，更新模型，進行情緒分析。
+        4. 根據模式執行回測或實時交易。
+        5. 定期保存數據並清理舊備份。
+    """
+    # 設置日誌
+    setup_logging(mode)
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 程式啟動中")
+    logging.info(f"Starting program in {mode} mode", extra={'mode': mode})
+    # 載入配置
+    try:
+        config, api_key, system_config, trading_params = load_config()
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 設定載入成功")
+        logging.info("Configuration loaded successfully", extra={'mode': mode})
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 設定載入失敗")
+        logging.error(f"Failed to load configuration: {str(e)}", extra={'mode': mode})
+        return
+    # 設置代理（僅執行一次）
+    setup_proxy()
+    device_config, onnx_session = check_hardware()
+    db_path = system_config['db_path']
+    await initialize_db(db_path)
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫初始化完成")
+    logging.info("Database initialized", extra={'mode': mode})
+    # 定義日期範圍
+    date_range = {
+        'start': (datetime.now() - pd.Timedelta(days=trading_params['min_backtest_days'])).strftime('%Y-%m-%d'),
+        'end': datetime.now().strftime('%Y-%m-%d')
+    }
+    # 獲取多時間框架資料
+    timeframes = ['1h', '4h', '1d'] # 修正時間框架
+    data_frames = {}
+    tasks = []
+    for tf in timeframes:
+        start_time = time.time()
+        print(f"獲取 {tf} 資料中")
+        df = await fetch_data(
+            primary_api=system_config['data_source'],
+            backup_apis=['yfinance', 'fcs'],
+            date_range=date_range,
+            timeframe=tf,
+            db_path=db_path,
+            config=config
+        )
+        api_latency.labels(mode=mode).observe(time.time() - start_time)
+        if df.empty:
+            print(f"{tf} 資料獲取失敗")
+            logging.error(f"Failed to fetch {tf} data", extra={'mode': mode})
+            for task in tasks:
+                task.cancel()
+            return
+        # 傳遞 db_path, timeframe, config 給 compute_indicators，讓其內部存入 DB 和 CSV
+        df = await compute_indicators(df, db_path, tf, config)
+        data_frames[tf] = df
+        print(f"{tf} 資料處理完成")
+        logging.info(f"{tf} data preprocessing completed", extra={'mode': mode})
+
+    # 日期對齊：確保所有時間框架的數據日期範圍一致
+    common_dates = None
+    for tf in timeframes:
+        if not data_frames[tf].empty:
+            dates = set(data_frames[tf]['date'])
+            common_dates = dates if common_dates is None else common_dates.intersection(dates)
+    if common_dates:
+        for tf in timeframes:
+            if not data_frames[tf].empty:
+                data_frames[tf] = data_frames[tf][data_frames[tf]['date'].isin(common_dates)].copy()
+                logging.info(f"Aligned {tf} data to common dates, rows={len(data_frames[tf])}")
+    
+    # 獲取經濟日曆
+    economic_calendar = await fetch_economic_calendar(date_range, db_path, config)
+    if not economic_calendar.empty:
+        logging.info("Economic calendar is not empty", extra={'mode': mode})
+        data_frames['1d'] = data_frames['1d'].merge(
+            economic_calendar[['date', 'event', 'impact', 'fed_funds_rate']], on='date', how='left'
+        )
+        data_frames['1d']['impact'] = data_frames['1d']['impact'].fillna('Low')
+    # 啟動定期儲存任務
+    for tf in timeframes:
+        if not data_frames[tf].empty:
+            tasks.append(asyncio.create_task(save_periodically(data_frames[tf], tf, db_path, system_config['root_dir'], data_type='ohlc')))
+            tasks.append(asyncio.create_task(save_periodically(data_frames[tf], tf, db_path, system_config['root_dir'], data_type='indicators')))
+    if not economic_calendar.empty:
+        tasks.append(asyncio.create_task(save_periodically(economic_calendar, '1d', db_path, system_config['root_dir'], data_type='economic')))
+    # 清理舊備份
+    clean_old_backups(system_config['root_dir'])
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 備份清理完成")
+    logging.info("Old backup files cleaned", extra={'mode': mode})
+    # 檢查波動性
+    if '1h' not in data_frames or data_frames['1h'].empty or 'ATR' not in data_frames['1h'].columns:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 1小时数据或ATR列缺失，使用默认会话模式 'normal'")
+        logging.warning("1h data or ATR column missing, defaulting to 'normal' session", extra={'mode': mode})
+        session = 'normal'
+    else:
+        if not check_volatility(data_frames['1h']['ATR'].mean(), threshold=trading_params['atr_threshold']):
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 高波动，暂停执行")
+            logging.warning("High volatility detected, halting execution", extra={'mode': mode})
+            for task in tasks:
+                task.cancel()
+            return
+    # 模型更新與訓練
+    session = 'high_volatility' if data_frames['1h']['ATR'].iloc[-1] &gt; trading_params['atr_threshold'] else 'normal'
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 更新模型中")
+    models = update_model(data_frames['1d'], 'models', session, device_config)
+    if not models:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 模型更新失敗")
+        logging.error("Model update failed", extra={'mode': mode})
+        for task in tasks:
+            task.cancel()
+        return
+    # 情緒分析整合
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 進行情緒分析中")
+    sentiment_score = await predict_sentiment(date_range['end'], db_path, config)
+    sentiment_adjustment = integrate_sentiment(sentiment_score)
+    print(f"情緒分析完成，分數={sentiment_score:.2f}")
+    logging.info(f"Sentiment analysis result: score={sentiment_score}, adjustment={sentiment_adjustment}", extra={'mode': mode})
+    # 準備交易環境與 PPO
+    env = ForexEnv(data_frames)
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 訓練 PPO 模型中")
+    ppo_model = train_ppo(env, device_config)
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} PPO 訓練完成")
+    logging.info("PPO model training completed", extra={'mode': mode})
+    # 交易決策
+    action = make_decision(ppo_model, data_frames, sentiment_score)
+    print(f"交易決策：{action}")
+    logging.info(f"Trading decision: {action}", extra={'mode': mode})
+    # 風險管理
+    if '1h' not in data_frames or data_frames['1h'].empty or 'ATR' not in data_frames['1h'].columns or 'close' not in data_frames['1h'].columns:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 1小时数据或必要列缺失，无法进行风险管理")
+        logging.error("1h data or required columns missing, cannot proceed with risk management", extra={'mode': mode})
+        for task in tasks:
+            task.cancel()
+        return
+    atr = data_frames['1h']['ATR'].iloc[-1]
+    predicted_vol = predict_volatility(data_frames['1h'], model_path='models/volatility_model.pkl')
+    current_price = data_frames['1h']['close'].iloc[-1]
+    stop_loss = calculate_stop_loss(current_price, atr, action)
+    take_profit = calculate_take_profit(current_price, atr, action)
+    position_size = await calculate_position_size(trading_params['capital'], trading_params['risk_percent'], current_price - stop_loss, sentiment_score, db_path)
+    logging.info(f"Action: {action}, Stop Loss: {stop_loss}, Take Profit: {take_profit}, Position Size: {position_size}", extra={'mode': mode})
+    trade = {'action': action, 'price': current_price, 'quantity': position_size, 'stop_loss': stop_loss, 'take_profit': take_profit, 'leverage': 1}
+    if not compliance_check(trade):
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 交易不符合規定")
+        logging.warning("Trade does not comply with leverage limits", extra={'mode': mode})
+        for task in tasks:
+            task.cancel()
+        return
+    # 根據模式執行回測或實時交易
+    if mode == 'backtest':
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 執行回測中")
+        result = backtest(data_frames['1d'], lambda x: make_decision(ppo_model, data_frames, sentiment_score), initial_capital=trading_params['capital'])
+        logging.info(f"Backtest Results: {result}", extra={'mode': mode})
+        report_dir = Path('reports')
+        report_dir.mkdir(exist_ok=True)
+        pd.DataFrame([result]).to_csv(report_dir / f'backtest_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv', index=False)
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 回測完成")
+        logging.info("Backtest completed, report generated", extra={'mode': mode})
+    elif mode == 'live':
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 啟動實時交易")
+        ib = connect_ib()
+        trade_counter.labels(action=action, mode=mode).inc()
+        execute_trade(ib, action, current_price, position_size, stop_loss, take_profit)
+        st.title("USD/JPY 交易儀表板")
+        st.line_chart(data_frames['1h']['close'])
+        st.write("最新決策:", action)
+        st.write("最新指標:", data_frames['1h'][['RSI', 'MACD', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26']].iloc[-1])
+        override_action = st.selectbox("手動覆寫決策", ["無", "買入", "賣出", "持有"])
+        if override_action != "無":
+            action = override_action
+            logging.info(f"User overridden decision: {action}", extra={'mode': mode})
+            trade_counter.labels(action=action, mode=mode).inc()
+            execute_trade(ib, action, current_price, position_size, stop_loss, take_profit)
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 實時交易執行中")
+        logging.info("Live trading mode running", extra={'mode': mode})
+    # 清理任務
+    for task in tasks:
+        task.cancel()
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 程式執行完畢")
+    logging.info("Program execution completed", extra={'mode': mode})
+def compliance_check(trade: dict) -&gt; bool:
+    """檢查交易是否符合槓桿限制。
+    邏輯：確保槓桿不超過 30:1，符合監管要求。
+    """
+    leverage = trade.get('leverage', 1)
+    is_compliant = leverage &lt;= 30
+    logging.info(f"Leverage check: leverage={leverage}, compliant={is_compliant}", extra={'mode': 'compliance'})
+    return is_compliant
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="USD/JPY 自動交易系統")
+    parser.add_argument('--mode', choices=['backtest', 'live'], default='backtest', help="運行模式：回測或實時交易")
+    args = parser.parse_args()
+    asyncio.run(main(args.mode))</code></pre>
+
+    <h2>.\risk_management.py</h2>
+    <pre><code>import xgboost as xgb
+import pandas as pd
+import logging
+from psutil import virtual_memory, cpu_percent
+import onnxruntime as ort
+import numpy as np
+from pathlib import Path
+import aiosqlite
+from datetime import datetime
+from ai_models import FEATURES
+async def get_current_exposure(db_path: str) -&gt; float:
+    """獲取當前總持倉暴露（以美元計）。"""
+    # 函數說明：從資料庫查詢當前持倉總暴露值。
+    try:
+        async with aiosqlite.connect(db_path, timeout=10) as conn:
+            cursor = await conn.execute("SELECT SUM(SUM(volume * price)) as total_exposure FROM trades WHERE action IN ('買入', '賣出')")
+            result = await cursor.fetchone()
+            total_exposure = result[0] or 0.0
+            logging.info(f"當前總持倉暴露: {total_exposure}")
+            return total_exposure
+    except Exception as e:
+        logging.error(f"獲取持倉暴露失敗: {e}")
+        return 0.0
+def calculate_stop_loss(current_price: float, atr: float, action: str, multiplier: float = 2) -&gt; float:
+    """計算止損：基於 ATR 動態調整，區分多頭和空頭。"""
+    # 函數說明：根據 ATR 和交易方向計算止損價格。
+    try:
+        if action == "買入":
+            stop_loss = current_price - (multiplier * atr)
+        elif action == "賣出":
+            stop_loss = current_price + (multiplier * atr)
+        else:
+            stop_loss = current_price
+        logging.info(f"計算止損: 當前價格={current_price}, ATR={atr}, 行動={action}, 止損={stop_loss}")
+        return stop_loss
+    except Exception as e:
+        logging.error(f"止損計算錯誤: {e}")
+        return current_price
+def calculate_take_profit(current_price: float, atr: float, action: str, multiplier: float = 2) -&gt; float:
+    """計算止盈：基於 ATR 動態調整，區分多頭和空頭。"""
+    # 函數說明：根據 ATR 和交易方向計算止盈價格。
+    try:
+        if action == "買入":
+            take_profit = current_price + (multiplier * atr)
+        elif action == "賣出":
+            take_profit = current_price - (multiplier * atr)
+        else:
+            take_profit = current_price
+        logging.info(f"計算止盈: 當前價格={current_price}, ATR={atr}, 行動={action}, 止盈={take_profit}")
+        return take_profit
+    except Exception as e:
+        logging.error(f"止盈計算錯誤: {e}")
+        return current_price
+def check_resources(threshold_mem: float = 0.9, threshold_cpu: float = 80.0) -&gt; bool:
+    """檢查系統資源：確保記憶體和 CPU 使用率不過高，記憶體閾值調整為 90%。"""
+    # 函數說明：檢查系統資源使用率，若超過閾值則返回 False。
+    try:
+        mem = virtual_memory()
+        cpu = cpu_percent(interval=1)
+        if mem.percent &gt; threshold_mem * 100 or cpu &gt; threshold_cpu:
+            logging.warning(f"資源使用過高：記憶體 {mem.percent}%，CPU {cpu}%")
+            return False
+        logging.info(f"資源檢查通過：記憶體 {mem.percent}%，CPU {cpu}%")
+        return True
+    except Exception as e:
+        logging.error(f"資源檢查錯誤: {e}")
+        return False
+async def calculate_position_size(capital: float, risk_percent: float, stop_loss_distance: float, sentiment: float = 0.0, db_path: str = "C:\\Trading\\data\\trading_data.db") -&gt; float:
+    """計算倉位大小：控制風險，檢查總持倉暴露（5% 資本）及槓桿限制（30:1）。"""
+    # 函數說明：計算交易倉位大小，考慮風險百分比、情緒調整和暴露限額。
+    try:
+        if abs(sentiment) &gt; 0.8:
+            logging.warning(f"極端情緒分數: {sentiment}，倉位大小設為 0")
+            return 0.0
+        # 關鍵邏輯：計算基礎倉位並根據情緒調整。
+        base_size = (capital * risk_percent) / stop_loss_distance if stop_loss_distance &gt; 0 else 0
+        adjustment = 1.2 if sentiment &gt; 0.4 else 0.8 if sentiment &lt; -0.4 else 1.0
+        position_size = base_size * adjustment
+        # 檢查總持倉暴露
+        total_exposure = await get_current_exposure(db_path)
+        max_exposure = capital * 0.05 # 最大暴露限額為資本的 5%
+        if total_exposure + (position_size * stop_loss_distance) &gt; max_exposure:
+            logging.warning(f"超過最大暴露限額: 當前={total_exposure}, 擬新增={position_size * stop_loss_distance}, 限額={max_exposure}")
+            return 0.0
+        # 檢查槓桿限制
+        leverage = (position_size * stop_loss_distance) / capital if capital &gt; 0 else 0
+        if leverage &gt; 30:
+            logging.warning(f"槓桿超過 30:1: 計算槓桿={leverage:.2f}")
+            return 0.0
+        logging.info(f"計算倉位大小：基礎={base_size:.2f}，情緒調整={adjustment:.2f}，最終={position_size:.2f}，槓桿={leverage:.2f}")
+        return position_size
+    except Exception as e:
+        logging.error(f"倉位計算錯誤: {e}")
+        return 0
+def predict_volatility(df: pd.DataFrame, model_path: str = 'models/lightgbm_model_quantized.onnx') -&gt; float:
+    """預測波動性：使用 ONNX LightGBM 模型預測 ATR。"""
+    # 函數說明：使用 ONNX 模型預測未來波動性，若失敗則回退到平均 ATR。
+    try:
+        X = df[FEATURES].iloc[-1:].values.astype(np.float32)
+        if len(X) == 0:
+            logging.error("X 數據為空，回退到平均 ATR")
+            return df['ATR'].mean()
+        model_dir = Path(model_path).parent
+        model_dir.mkdir(exist_ok=True)
+        session = ort.InferenceSession(model_path, providers=['VitisAIExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'])
+        pred = session.run(None, {'input': X})[0][0]
+        logging.info(f"LightGBM 波動性預測: {pred}")
+        return pred
+    except Exception as e:
+        logging.error(f"波動預測錯誤: {e}")
+        return df['ATR'].mean()</code></pre>
+
+    <h2>.\trading_strategy.py</h2>
+    <pre><code>from stable_baselines3 import PPO
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+from ib_insync import IB, Forex, BracketOrder
+import logging
+from risk_management import check_resources, calculate_stop_loss, calculate_position_size
+from utils import load_settings
+from ai_models import FEATURES                     
+class ForexEnv(gym.Env):
+    """外匯環境：用於 PPO 強化學習訓練，支援多時間框架。"""
+    # 類別說明：自定義 Gym 環境，用於模擬外匯交易，支援多時間框架觀察空間。
+    def __init__(self, data_frames: dict, spread: float = 0.0002):
+        super().__init__()
+        tf_mapping = {'1 hour': '1h', '4 hours': '4h', '1 day': '1d'}
+        self.data_frames = {tf_mapping.get(k, k): v for k, v in data_frames.items()}
+        self.spread = spread
+        self.current_step = 0
+        self.action_space = gym.spaces.Discrete(3) # 買, 賣, 持
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(27,), dtype=np.float32
+        ) # 9 features × 3 timeframes 1h/4h/daily 的 5 個指標
+    def reset(self):
+        self.current_step = 0
+        return self._get_obs()
+    def _get_obs(self):
+        # 關鍵邏輯：從多時間框架提取觀察值，若數據不足則填充 0。
+        obs = []
+        for tf in ['1h', '4h', '1d']:
+            df = self.data_frames[tf]
+            if self.current_step &lt; len(df):
+                obs.extend(df[FEATURES[:-1]].iloc[self.current_step].values)  # 排除fed_funds_rate如果不需要
+            else:
+                obs.extend([0] * 9) # 填充 0 以保持形狀一致
+        return np.array(obs, dtype=np.float32)
+    def step(self, action):
+        price = self.data_frames['1h']['close'].iloc[self.current_step]
+        reward = 0
+        if action == 0: # 買
+            reward -= self.spread
+        elif action == 1: # 賣
+            reward -= self.spread
+        self.current_step += 1
+        done = self.current_step &gt;= min(len(self.data_frames[tf]) for tf in self.data_frames) - 1
+        return self._get_obs(), reward, done, {}
+def train_ppo(env, device_config: dict = None):
+    """訓練 PPO：強化學習優化交易決策。，從 config 載入參數。
+    邏輯：使用 MlpPolicy，根據配置的步數學習，保存模型。
+    """
+    # 函數說明：訓練 PPO 模型，用於強化學習決策優化。
+    try:
+        config = load_settings() # 載入配置
+        total_timesteps = config.get('trading_params', {}).get('ppo_timesteps', 1000) # 從 config 獲取，若無則預設 1000
+        learning_rate = config.get('trading_params', {}).get('ppo_learning_rate', 0.0003)# 從 config 獲取，若無則預設 0.0003
+        device = device_config.get('ppo', torch.device('cpu')) if device_config else torch.device('cpu')
+        logging.info(f"PPO 訓練：使用 total_timesteps={total_timesteps}, learning_rate={learning_rate}, device={device}")
+        model = PPO("MlpPolicy", env, verbose=0, learning_rate=learning_rate, device=device)
+        model.learn(total_timesteps=total_timesteps)
+        model.save("models/ppo_model")
+        logging.info("PPO 模型訓練完成")
+        return model
+    except Exception as e:
+        logging.error(f"PPO 訓練錯誤: {e}")
+        return None
+def make_decision(model, data_frames: dict, sentiment: float) -&gt; str:
+    """產生決策：結合多時間框架技術指標和情緒分數。"""
+    # 函數說明：結合技術指標、情緒分數和 PPO 模型產生買賣持倉決策。
+    try:
+        # 檢查系統資源
+        if not check_resources():
+            logging.warning("資源不足，暫停交易")
+            return "持有"
+        # 多框架技術指標邏輯
+        buy_signals = []
+        sell_signals = []
+        for tf in ['1h', '4h', '1d']:
+            df = data_frames[tf]
+            if df.empty:
+                continue
+            rsi = df['RSI'].iloc[-1]
+            macd = df['MACD'].iloc[-1]
+            macd_signal = df['MACD_signal'].iloc[-1]
+            stoch_k = df['Stoch_k'].iloc[-1]
+            adx = df['ADX'].iloc[-1]
+            # 更新 Ichimoku 信號：考慮 Tenkan-sen 和 Kijun-sen
+            ichimoku_buy = (df['Ichimoku_tenkan'].iloc[-1] &gt; df['Ichimoku_kijun'].iloc[-1] and
+                           df['close'].iloc[-1] &gt; df['Ichimoku_cloud_top'].iloc[-1])
+            ichimoku_sell = (df['Ichimoku_tenkan'].iloc[-1] &lt; df['Ichimoku_kijun'].iloc[-1] and
+                            df['close'].iloc[-1] &lt; df['Ichimoku_cloud_top'].iloc[-1])
+            bb_signal = df['close'].iloc[-1] &lt; df['BB_lower'].iloc[-1]
+            ema_signal = df['EMA_12'].iloc[-1] &gt; df['EMA_26'].iloc[-1]
+									  
+            economic_impact = df['impact'].iloc[-1] if 'impact' in df.columns and not pd.isna(df['impact'].iloc[-1]) else 'Low'
+            economic_pause = economic_impact in ['High', 'Medium']
+            buy_signals.append(rsi &lt; 30 and macd &gt; macd_signal and stoch_k &lt; 20 and adx &gt; 25 and ichimoku_buy and bb_signal and ema_signal and not economic_pause)
+            sell_signals.append(rsi &gt; 70 and macd &lt; macd_signal and stoch_k &gt; 80 and adx &gt; 25 and ichimoku_sell and df['close'].iloc[-1] &gt; df['BB_upper'].iloc[-1] and df['EMA_12'].iloc[-1] &lt; df['EMA_26'].iloc[-1] and not economic_pause)
+        # 關鍵邏輯：計算買賣信號分數並根據情緒調整。
+        buy_score = sum(1 for s in buy_signals if s) / len(buy_signals) if buy_signals else 0
+        sell_score = sum(1 for s in sell_signals if s) / len(sell_signals) if sell_signals else 0
+        # 情緒調整
+        if abs(sentiment) &gt; 0.8:
+            logging.warning(f"極端情緒分數: {sentiment}，暫停交易")
+            return "持有"
+        sentiment_adjust = 0.2 if sentiment &gt; 0.4 else -0.2 if sentiment &lt; -0.4 else 0.0
+        buy_score += sentiment_adjust
+        sell_score -= sentiment_adjust
+        # PPO 決策
+        obs = []
+        for tf in ['1h', '4h', '1d']:
+            df = data_frames.get(tf, pd.DataFrame())
+            if not df.empty:
+                obs.extend(df[FEATURES[:-1]].iloc[-1].values)  # 排除fed_funds_rate
+            else:
+                obs.extend([0] * 9)
+        action, _ = model.predict(np.array(obs, dtype=np.float32))
+        ppo_action = ["買入", "賣出", "持有"][action]
+        # 最終決策：結合多框架信號和 PPO
+        if buy_score &gt; 0.6 and ppo_action == "買入":
+            return "買入"
+        elif sell_score &gt; 0.6 and ppo_action == "賣出":
+            return "賣出"
+        return "持有"
+    except Exception as e:
+        logging.error(f"決策錯誤: {e}")
+        return "持有"
+def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 10000, spread: float = 0.0002) -&gt; dict:
+    """回測：模擬交易，計算績效指標，包含持倉管理。"""
+    # 函數說明：模擬歷史數據上的交易決策，計算最終資本、夏普比率等指標。
+    capital = initial_capital
+    position_size = 0.0
+    total_cost = 0.0
+    entry_price = None
+    trades = []
+    equity_curve = []
+    for i, row in df.iterrows():
+        if not check_resources():
+            logging.warning("資源不足，跳過交易")
+            continue
+        action = strategy(row)
+        current_price = row['close']
+        sentiment = row.get('sentiment', 0.0)
+        atr = row['ATR']
+        stop_loss_distance = abs(calculate_stop_loss(current_price, atr) - current_price)
+        calc_position = calculate_position_size(initial_capital, 0.01, stop_loss_distance, sentiment)
+        # 關鍵邏輯：處理買入/賣出決策，包括平倉和開倉。
+        if action == "買入" and position_size &lt;= 0:
+            if position_size &lt; 0: # 平空頭
+                profit = (entry_price - current_price) * abs(position_size)
+                capital += profit
+                trades.append({
+                    'date': row['date'],
+                    'action': '平空',
+                    'price': current_price,
+                    'profit': profit,
+                    'position_size': position_size
+                })
+            position_size = calc_position
+            total_cost = current_price * position_size
+            entry_price = current_price
+            leverage_cost = abs(position_size) * 0.0001  # 假設 0.01% 融資成本
+            capital -= leverage_cost
+            trades.append({
+                'date': row['date'],
+                'action': '買入',
+                'price': current_price,
+                'profit': 0.0,
+                'position_size': position_size
+            })
+        elif action == "賣出" and position_size &gt;= 0:
+            if position_size &gt; 0: # 平多頭
+                profit = (current_price - entry_price) * position_size
+                capital += profit
+                trades.append({
+                    'date': row['date'],
+                    'action': '平多',
+                    'price': current_price,
+                    'profit': profit,
+                    'position_size': position_size
+                })
+            position_size = -calc_position
+            total_cost = -current_price * abs(position_size)
+            entry_price = current_price
+            leverage_cost = abs(position_size) * 0.0001  # 假設 0.01% 融資成本
+            capital -= leverage_cost
+            trades.append({
+                'date': row['date'],
+                'action': '賣出',
+                'price': current_price,
+                'profit': 0.0,
+                'position_size': position_size
+            })
+        equity_curve.append(capital + (current_price - entry_price) * position_size if position_size != 0 else capital)
+    equity_series = pd.Series(equity_curve)
+    returns = equity_series.pct_change().dropna()
+    return {
+        "final_capital": capital,
+        "sharpe_ratio": (returns.mean() * 252 - 0.02) / (returns.std() * np.sqrt(252)) if returns.std() != 0 else 0,
+        "max_drawdown": (equity_series / equity_series.cummax() - 1).min(),
+        "win_rate": len([r for r in returns if r &gt; 0]) / len(returns) if len(returns) &gt; 0 else 0,
+        "trades": trades
+    }
+def connect_ib(host='127.0.0.1', port=7497, client_id=1):
+    """連接 IB API：用於實時交易。
+    邏輯：建立連接，返回 IB 物件。
+    """
+    # 函數說明：連接 Interactive Brokers API 用於實時交易。
+    ib = IB()
+    ib.connect(host, port, client_id)
+    return ib
+def execute_trade(ib, action: str, price: float, quantity: float, stop_loss: float, take_profit: float):
+    """執行交易：使用括號訂單。
+    邏輯：根據行動創建訂單，附加止損/止盈。
+    """
+    # 函數說明：使用 BracketOrder 執行買賣訂單，並附加止損和止盈。
+    contract = Forex('USDJPY')
+    for attempt in range(3):
+        try:
+            if action == "買入":
+                order = BracketOrder('BUY', quantity, price, takeProfitPrice=take_profit, stopLossPrice=stop_loss)
+            elif action == "賣出":
+                order = BracketOrder('SELL', quantity, price, takeProfitPrice=stop_loss, stopLossPrice=take_profit)
+            else:
+                return
+            trade = ib.placeOrder(contract, order)
+            ib.sleep(1)
+            if trade.orderStatus.status in ['Filled', 'Submitted']:
+                logging.info(f"訂單狀態: {trade.orderStatus.status}")
+                return
+            else:
+                logging.warning(f"訂單失敗: {trade.orderStatus.status}, 重試 {attempt + 1}/3")
+        except Exception as e:
+            logging.error(f"交易執行錯誤: {e}, 重試 {attempt + 1}/3")
+        ib.sleep(2 ** attempt * 2)
+    logging.error("交易執行失敗，超過最大重試次數")</code></pre>
+
+    <h2>.\utils.py</h2>
+    <pre><code>import torch
+import onnxruntime as ort
+import redis
+import aiohttp
+import logging
+import os
+import sqlite3
+import pandas as pd
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+from pathlib import Path
+from datetime import datetime
+import json
+import traceback
+import aiofiles
+import asyncio
+import random
+# 設置日誌
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s - [%(module)s]',
+    handlers=[
+        logging.FileHandler('C:/Trading/logs/app.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+# 全局快取變數，用於確保配置僅載入一次
+_config_cache = None
+
+# 全局 Redis 客戶端
+_redis_client = None
+
+# 加密 API 密鑰（補充安全性）
+key = b'_eIKG0YhiJCyBQ-VvxAsx8LT3Vow-k0hE-i0iwK9wwM=' # 安全儲存
+cipher = Fernet(key)
+
+def encrypt_key(api_key: str) -&gt; bytes:
+    """加密 API 密鑰。"""
+    return cipher.encrypt(api_key.encode())
+    
+def decrypt_key(encrypted: bytes) -&gt; str:
+    """解密 API 密鑰。"""
+    return cipher.decrypt(encrypted).decode()
+    
+def get_redis_client(config: dict) -&gt; redis.Redis:
+    """獲取 Redis 客戶端，單例模式。"""
+    global _redis_client
+    if _redis_client is None and config.get('system_config', {}).get('use_redis', True):
+        try:
+            _redis_client = redis.Redis(host='localhost', port=6379, db=0)
+            _redis_client.ping()
+            logging.info("Redis 客戶端初始化成功")
+        except redis.RedisError as e:
+            logging.warning(f"無法初始化 Redis 客戶端: {str(e)}")
+            _redis_client = None
+    return _redis_client
+
+async def fetch_api_data(url: str, headers: dict = None, params: dict = None) -&gt; dict:
+    """通用 API 數據獲取函數，支援快取和重試。"""
+    cache_key = f"api_{url}_{params.get('start_time', '')}_{params.get('end_time', '')}"
+    redis_client = get_redis_client(load_settings())
+    if redis_client:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                logging.info(f"從 Redis 快取載入 API 數據: {cache_key}")
+                return json.loads(cached)
+        except redis.RedisError as e:
+            logging.warning(f"Redis 快取查詢失敗: {str(e)}")
+    
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(5):
+            try:
+                async with session.get(url, headers=headers, params=params, timeout=10) as response:
+                    data = await response.json()
+                    if redis_client:
+                        try:
+                            redis_client.setex(cache_key, 3600, json.dumps(data))
+                            logging.info(f"已快取 API 數據至 Redis: {cache_key}")
+                        except redis.RedisError as e:
+                            logging.warning(f"無法快取至 Redis: {str(e)}")
+                    return data
+            except Exception as e:
+                if attempt == 4:
+                    logging.error(f"API 獲取失敗: {str(e)}")
+                    return {}
+                await asyncio.sleep(2 ** attempt * 4)
+    return {}
+async def initialize_db(db_path: str):
+    """初始化 SQLite 資料庫，創建 OHLC、indicators、economic_calendar、sentiment_data、tweets 和 trades 表格。"""
+    # 從 load_settings 獲取 root_dir
+    config = load_settings()
+    root_dir = config.get('system_config', {}).get('root_dir', str(Path(db_path).parent))
+    
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    if os.path.exists(db_path):
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM sqlite_master")
+            cursor.close()
+            conn.close()
+        except sqlite3.DatabaseError:
+            logging.warning(f"資料庫檔案 {db_path} 損壞，將刪除並重新創建")
+            os.remove(db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ohlc (
+                date DATETIME,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume INTEGER,
+                n INTEGER,
+                vw REAL,
+                timeframe TEXT,
+                PRIMARY KEY (date, timeframe)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS indicators (
+                date DATETIME,
+                indicator TEXT,
+                value REAL,
+                timeframe TEXT,
+                PRIMARY KEY (date, indicator, timeframe)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS economic_calendar (
+                date DATETIME,
+                event TEXT,
+                impact TEXT,
+                fed_funds_rate REAL,
+                PRIMARY KEY (date, event)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sentiment_data (
+                date DATETIME,
+                sentiment REAL,
+                PRIMARY KEY (date)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tweets (
+                date DATETIME,
+                tweet_id TEXT,
+                text TEXT,
+                PRIMARY KEY (date, tweet_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME,
+                symbol TEXT,
+                price REAL,
+                action TEXT,
+                volume REAL,
+                stop_loss REAL,
+                take_profit REAL
+            )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫初始化成功：{db_path}")
+        await backup_database(db_path, root_dir)
+        logging.info(f"Database initialized: {db_path}")
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫初始化失敗：{str(e)}")
+        logging.error(f"Database initialization failed: {str(e)}, traceback={traceback.format_exc()}")
+        raise
+
+async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: str = 'ohlc') -&gt; bool:
+    """將數據增量儲存到 SQLite 資料庫。"""
+    loop = asyncio.get_event_loop()
+    try:
+        def sync_save_data():
+            conn = sqlite3.connect(db_path, timeout=10)
+            cursor = conn.cursor()
+            if data_type == 'ohlc':
+                ohlc_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']
+                df_to_save = df[ohlc_columns].copy()
+                df_to_save['timeframe'] = timeframe
+                cursor.execute("SELECT MAX(date) FROM ohlc WHERE timeframe = ?", (timeframe,))
+                last_date = cursor.fetchone()[0]
+                if last_date:
+                    df_to_save = df_to_save[df_to_save['date'] &gt; pd.to_datetime(last_date)]
+                if not df_to_save.empty:
+                    logging.info(f"Inserting data: min_date={df_to_save['date'].min()}, max_date={df_to_save['date'].max()}, rows={len(df_to_save)}")
+                    df_to_save.to_sql('ohlc', conn, if_exists='append', index=False)
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 增量儲存 {len(df_to_save)} 行 OHLC 數據至 SQLite：{timeframe}")
+                    logging.info(f"Incrementally saved {len(df_to_save)} OHLC rows to SQLite: timeframe={timeframe}")
+            elif data_type == 'indicators':
+                ohlc_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw']
+                indicator_columns = [col for col in df.columns if col not in ohlc_columns + ['event', 'impact', 'sentiment', 'fed_funds_rate']]
+                if indicator_columns:
+                    indicators_df = df[['date'] + indicator_columns].melt(id_vars=['date'], var_name='indicator', value_name='value')
+                    indicators_df['timeframe'] = timeframe
+                    cursor.execute("SELECT MAX(date) FROM indicators WHERE timeframe = ?", (timeframe,))
+                    last_date = cursor.fetchone()[0]
+                    if last_date:
+                        indicators_df = indicators_df[indicators_df['date'] &gt; pd.to_datetime(last_date)]
+                    if not indicators_df.empty:
+                        indicators_df.to_sql('indicators', conn, if_exists='append', index=False)
+                        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 增量儲存 {len(indicators_df)} 行技術指標至 SQLite：{timeframe}")
+                        logging.info(f"Incrementally saved {len(indicators_df)} indicator rows to SQLite: timeframe={timeframe}")
+            elif data_type == 'economic':
+                economic_columns = ['date', 'event', 'impact', 'fed_funds_rate']
+                df_to_save = df[economic_columns].copy()
+                cursor.execute("SELECT MAX(date) FROM economic_calendar")
+                last_date = cursor.fetchone()[0]
+                if last_date:
+                    df_to_save = df_to_save[df_to_save['date'] &gt; pd.to_datetime(last_date)]
+                if not df_to_save.empty:
+                    logging.info(f"Inserting data: min_date={df_to_save['date'].min()}, max_date={df_to_save['date'].max()}, rows={len(df_to_save)}")
+                    df_to_save.to_sql('economic_calendar', conn, if_exists='append', index=False)
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 增量儲存 {len(df_to_save)} 行經濟日曆數據至 SQLite")
+                    logging.info(f"Incrementally saved {len(df_to_save)} economic calendar rows to SQLite")
+            elif data_type == 'sentiment':
+                sentiment_columns = ['date', 'sentiment']
+                df_to_save = df[sentiment_columns].copy()
+                cursor.execute("SELECT MAX(date) FROM sentiment_data")
+                last_date = cursor.fetchone()[0]
+                if last_date:
+                    df_to_save = df_to_save[df_to_save['date'] &gt; pd.to_datetime(last_date)]
+                if not df_to_save.empty:
+                    logging.info(f"Inserting data: min_date={df_to_save['date'].min()}, max_date={df_to_save['date'].max()}, rows={len(df_to_save)}")
+                    df_to_save.to_sql('sentiment_data', conn, if_exists='append', index=False)
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 增量儲存 {len(df_to_save)} 行情緒數據至 SQLite")
+                    logging.info(f"Incrementally saved {len(df_to_save)} sentiment rows to SQLite")
+            elif data_type == 'tweets':
+                tweets_columns = ['date', 'tweet_id', 'text']
+                df_to_save = df[tweets_columns].copy()
+                cursor.execute("SELECT MAX(date) FROM tweets")
+                last_date = cursor.fetchone()[0]
+                if last_date:
+                    df_to_save = df_to_save[df_to_save['date'] &gt; pd.to_datetime(last_date)]
+                if not df_to_save.empty:
+                    logging.info(f"Inserting data: min_date={df_to_save['date'].min()}, max_date={df_to_save['date'].max()}, rows={len(df_to_save)}")
+                    df_to_save.to_sql('tweets', conn, if_exists='append', index=False)
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 增量儲存 {len(df_to_save)} 行推文數據至 SQLite")
+                    logging.info(f"Incrementally saved {len(df_to_save)} tweet rows to SQLite")
+            conn.commit()
+            conn.close()
+            return True
+        return await loop.run_in_executor(None, sync_save_data)
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {data_type} 數據儲存失敗：{str(e)}")
+        logging.error(f"Failed to save {data_type} data to SQLite: {str(e)}, traceback={traceback.format_exc()}")
+        return False
+async def backup_database(db_path: str, root_dir: str):
+    """備份 SQLite 資料庫。"""
+    backup_dir = Path(root_dir) / 'backups'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_file = backup_dir / f"trading_data_{datetime.now().strftime('%Y%m%d')}.db"
+    try:
+        async with aiofiles.open(db_path, mode='rb') as src, aiofiles.open(backup_file, mode='wb') as dst:
+            content = await src.read()
+            await dst.write(content)
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫已備份至 {backup_file}")
+        logging.info(f"Database backed up to {backup_file}")
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫備份失敗：{str(e)}")
+        logging.error(f"Database backup failed: {str(e)}, traceback={traceback.format_exc()}")
+async def save_periodically(df_buffer: pd.DataFrame, timeframe: str, db_path: str, root_dir: str, data_type: str = 'ohlc'):
+    """定期將緩衝區數據保存到 SQLite 並進行每日備份。"""
+    save_interval = 1800 if timeframe == '1 hour' else 3 * 3600
+    while True:
+        try:
+            if not df_buffer.empty:
+                await save_data(df_buffer, timeframe, db_path, data_type)
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {data_type} 數據已增量保存至 SQLite")
+                logging.info(f"Data incrementally saved to SQLite: timeframe={timeframe}, data_type={data_type}")
+            if datetime.now().hour == 0 and datetime.now().minute &lt; 5:
+                await backup_database(db_path, root_dir)
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 資料庫已備份")
+                logging.info("Database backed up")
+            await asyncio.sleep(save_interval)
+        except Exception as e:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 定期保存失敗：{str(e)}")
+            logging.error(f"Periodic save failed: {str(e)}, traceback={traceback.format_exc()}")
+def load_settings():
+    """載入所有設定檔案並生成 requirements.txt。"""
+    global _config_cache
+    if _config_cache is not None:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 從快取載入配置")
+        logging.info("Loaded config from cache")
+        return _config_cache
+    config = {}
+    root_dir = "C:\\Trading"
+    config_dir = Path(root_dir) / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    default_api_key = {}
+    default_trading_params = {
+        "max_position_size": 10000,
+        "risk_per_trade": 0.01,
+        "price_diff_threshold": {"high_volatility": 0.005, "normal": 0.003},
+        "rsi_overbought": 70,
+        "rsi_oversold": 30,
+        "stoch_overbought": 80,
+        "stoch_oversold": 20,
+        "adx_threshold": 25,
+        "obv_window": 14,
+        "capital": 10000,
+        "risk_percent": 0.01,
+        "atr_threshold": 0.02,
+        "min_backtest_days": 180,
+        "ppo_learning_rate": 0.0003,
+        "ppo_timesteps": 10000
+    }
+    default_system_config = {
+        "data_source": "polygon",
+        "symbol": "USDJPY=X",
+        "timeframe": "1d",
+        "root_dir": "C:\\Trading",
+        "db_path": "C:\\Trading\\data\\trading_data.db",
+        "proxies": {
+            "http": "http://proxy1.scig.gov.hk:8080",
+            "https": "http://proxy1.scig.gov.hk:8080"
+        },
+        "use_redis": False,  # 禁用 Redis 避免連線錯誤
+        "dependencies": [],
+        "model_dir": "models",
+        "model_periods": ["short_term", "medium_term", "long_term"]
+    }
+    config_files = {
+        'api_key': config_dir / 'api_key.json',
+        'trading_params': config_dir / 'trading_params.json',
+        'system_config': config_dir / 'system_config.json'
+    }
+    try:
+        for key, file_path in config_files.items():
+            if file_path.exists():
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    config[key] = json.load(f)
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 成功載入設定檔：{file_path}")
+                logging.info(f"Successfully loaded config file: {file_path}")
+            else:
+                if key == 'api_key':
+                    default = default_api_key
+                elif key == 'trading_params':
+                    default = default_trading_params
+                elif key == 'system_config':
+                    default = default_system_config
+                config[key] = default
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(default, f, indent=4, ensure_ascii=False)
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 設定檔不存在，已創建預設：{file_path}")
+                logging.info(f"Created default config file: {file_path}")
+        if 'api_key' in config:
+            for k, v in config['api_key'].items():
+                if v:  # 僅加密非空密鑰
+                    config['api_key'][k] = encrypt_key(v)
+        system_config = config.get('system_config', {})
+        dependencies = system_config.get('dependencies', [])
+        if not dependencies:
+            dependencies = ["pandas&gt;=2.0.0",
+                "yfinance&gt;=0.2.0",
+                "requests&gt;=2.28.0",
+                "textblob&gt;=0.17.0",
+                "torch&gt;=2.0.0",
+                "scikit-learn&gt;=1.3.0",
+                "xgboost&gt;=2.0.0",
+                "lightgbm&gt;=4.0.0",
+                "onnx&gt;=1.14.0",
+                "onnxruntime&gt;=1.16.0",
+                "transformers&gt;=4.30.0",
+                "stable-baselines3&gt;=2.0.0",
+                "pandas-ta&gt;=0.3.0",
+                "aiosqlite&gt;=0.19.0",
+                "gymnasium&gt;=0.29.0",
+                "python-dotenv&gt;=1.0.0",
+                "redis&gt;=5.0.0",
+                "streamlit&gt;=1.25.0",
+                "prometheus-client&gt;=0.17.0",
+                "ib-insync&gt;=0.9.0",
+                "cryptography&gt;=41.0.0",
+                "scipy&gt;=1.10.0",
+                "numpy&gt;=1.24.0",
+                "joblib&gt;=1.3.0",
+                "psutil&gt;=5.9.0",
+                "onnxmltools&gt;=1.11.0",
+                "onnxconverter-common&gt;=1.13.0",
+                "aiohttp&gt;=3.8.0",
+                "aiofiles&gt;=23.1.0",
+                "investpy&gt;=1.0.0",
+                "torch-directml&gt;=0.2.0"
+            ]
+            system_config['dependencies'] = dependencies
+            with open(config_files['system_config'], 'w', encoding='utf-8') as f:
+                json.dump(system_config, f, indent=4, ensure_ascii=False)
+            logging.info("Filled default dependencies in system_config.json")
+        requirements_path = Path(root_dir) / 'requirements.txt'
+        with open(requirements_path, 'w', encoding='utf-8') as f:
+            for dep in dependencies:
+                f.write(f"{dep}\n")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已生成/更新 requirements.txt：{requirements_path}")
+        logging.info(f"Generated requirements.txt: {requirements_path}")
+        _config_cache = config
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 設定檔載入成功！")
+        logging.info("Config files loaded successfully")
+        return config
+    except Exception as e:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 設定檔載入失敗：{str(e)}")
+        logging.error(f"Failed to load config files: {str(e)}, traceback={traceback.format_exc()}")
+        return {}
+def check_hardware():
+    """硬體檢測：檢測 GPU/NPU/CPU 並為不同模型指定設備。"""
+    try:
+        import torch_directml
+        gpu_available = torch_directml.is_available()
+        device = torch_directml.device() if gpu_available else torch.device('cpu')
+        logging.info(f"使用裝置: {device}")
+    except ImportError:
+        device = torch.device('cpu')
+        logging.info("回退到 CPU")
+    providers = ort.get_available_providers()
+    onnx_provider = 'VitisAIExecutionProvider' if 'VitisAIExecutionProvider' in providers else 'CUDAExecutionProvider' if 'CUDAExecutionProvider' in providers else 'CPUExecutionProvider'
+    logging.info(f"ONNX provider: {onnx_provider}")
+    device_config = {
+        'lstm': device,
+        'finbert': device,
+        'xgboost': torch.device('cpu'),
+        'randomforest': torch.device('cpu'),
+        'lightgbm': torch.device('cpu'),
+        'timeseries_transformer': device,
+        'distilbert': device,
+        'ppo': device
+    }
+    try:
+        session = ort.InferenceSession('models/lstm_model_quantized.onnx', providers=[onnx_provider])
+    except Exception as e:
+        logging.warning(f"Failed to load ONNX session: {str(e)}, using CPU")
+        session = None
+    return device_config, session
+# 引入代理快取
+_proxy_cache = None
+def get_proxy(config: dict) -&gt; dict:
+    """獲取代理設置，支援快取並檢查環境變數，確保只載入一次。"""
+    global _proxy_cache
+    if _proxy_cache is not None:
+        logging.info("從快取載入代理設置")
+        return _proxy_cache
+
+    proxies = config.get('system_config', {}).get('proxies', {})
+    if not proxies:
+        # 檢查環境變數作為備用
+        http_proxy = os.getenv('HTTP_PROXY')
+        https_proxy = os.getenv('HTTPS_PROXY')
+        if http_proxy or https_proxy:
+            proxies = {'http': http_proxy, 'https': https_proxy}
+            logging.info(f"從環境變數載入代理: {proxies}")
+        else:
+            logging.info("無代理設置")
+            proxies = {}
+    
+    _proxy_cache = proxies
+    logging.info(f"代理設置已快取: {proxies}")
+    return proxies
+
+async def test_proxy(proxy: dict) -&gt; bool:
+    """測試代理是否可用，連續測試 3 次以確保穩定性。"""
+    if not proxy:
+        return True
+    test_url = "https://www.google.com"
+    success_count = 0
+    for _ in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(test_url, proxy=proxy.get('http'), timeout=5) as response:
+                    if response.status == 200:
+                        success_count += 1
+        except Exception:
+            continue
+        await asyncio.sleep(1)
+    if success_count &gt;= 2:
+        logging.info(f"代理測試成功: {proxy}，成功次數={success_count}/3")
+        return True
+    logging.warning(f"代理測試失敗: {proxy}，成功次數={success_count}/3")
+    return False
+def setup_proxy():
+    """設置全局代理：從環境變數載入並設置到 os.environ，僅執行一次。"""
+    if os.getenv('HTTP_PROXY') and os.getenv('HTTPS_PROXY'):
+        logging.info("全局代理已設置，跳過重複設置")
+        return
+    load_dotenv()
+    proxy = os.getenv('HTTP_PROXY')
+    if proxy:
+        os.environ['http_proxy'] = proxy
+        os.environ['https_proxy'] = proxy
+        logging.info(f"全局代理設置: {proxy}")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 全局代理設置成功")
+    else:
+        logging.info("無全局代理設置")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 無全局代理設置")
+def clear_proxy_cache():
+    """清除代理快取。"""
+    global _proxy_cache
+    _proxy_cache = None
+    logging.info("代理快取已清除")
+def check_volatility(atr: float, threshold: float = 0.02) -&gt; bool:
+    """檢查波動：若 ATR &gt; 閾值，暫停。"""
+    if atr &gt; threshold:
+        logging.warning("高波動偵測")
+        return False
+    return True
+def clear_config_cache():
+    """清除配置快取。"""
+    global _config_cache
+    _config_cache = None
+    logging.info("Config cache cleared")
+def filter_future_dates(df: pd.DataFrame) -&gt; pd.DataFrame:
+    """過濾未來日期數據。"""
+    if not df.empty and 'date' in df.columns:
+        current_time = pd.to_datetime(datetime.now())
+        initial_rows = len(df)
+        df = df[df['date'] &lt;= current_time].copy()
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 已過濾未來日期，初始行數={initial_rows}，剩餘行數={len(df)}")
+        logging.info(f"Filtered future dates, initial_rows={initial_rows}, remaining_rows={len(df)}")
+    return df</code></pre>
+
+    <h2>.\config\system_config.json</h2>
+    <pre><code>{
+    "data_source": "polygon",
+    "symbol": "USDJPY=X",
+    "timeframe": "1d",
+    "capital": 10000,
+    "risk_percent": 0.01,
+    "atr_threshold": 0.02,
+    "root_dir": "C:\\Trading",
+    "db_path": "C:\\Trading\\data\\trading_data.db",
+    "min_backtest_days": 180,
+    "indicators": {
+        "RSI": true,
+        "MACD": true,
+        "ATR": true,
+        "Stochastic": true,
+        "Bollinger": true,
+        "EMA": true
+    },
+  "proxies": {
+        "http": "http://proxy1.scig.gov.hk:8080",
+        "https": "http://proxy1.scig.gov.hk:8080"
+  },
+    "dependencies": ["pandas&gt;=2.0.0",
+            "yfinance&gt;=0.2.0",
+            "requests&gt;=2.28.0",
+            "textblob&gt;=0.17.0",
+            "torch&gt;=2.0.0",
+            "scikit-learn&gt;=1.3.0",
+            "xgboost&gt;=2.0.0",
+            "lightgbm&gt;=4.0.0",
+            "onnx&gt;=1.14.0",
+            "onnxruntime&gt;=1.16.0",
+            "transformers&gt;=4.30.0",
+            "stable-baselines3&gt;=2.0.0",
+            "pandas-ta&gt;=0.3.0",
+            "aiosqlite&gt;=0.19.0",
+            "gymnasium&gt;=0.29.0",
+            "python-dotenv&gt;=1.0.0",
+            "redis&gt;=5.0.0",
+            "streamlit&gt;=1.25.0",
+            "prometheus-client&gt;=0.17.0",
+            "ib-insync&gt;=0.9.0",
+            "cryptography&gt;=41.0.0",
+            "scipy&gt;=1.10.0",
+            "numpy&gt;=1.24.0",
+            "joblib&gt;=1.3.0",
+            "psutil&gt;=5.9.0",
+            "onnxmltools&gt;=1.11.0",
+            "onnxconverter-common&gt;=1.13.0",
+            "aiohttp&gt;=3.8.0",
+            "aiofiles&gt;=23.1.0",
+            "investpy&gt;=1.0.0",
+            "torch-directml&gt;=0.2.0"
+],
+    "model_dir": "models",
+    "model_periods": ["short_term", "medium_term", "long_term"],
+    "use_redis": false
+}</code></pre>
+
+    <h2>.\config\trading_params.json</h2>
+    <pre><code>{
+    "ppo_learning_rate": 0.0003,
+    "ppo_timesteps": 10000,
+"max_position_size": 10000,
+    "risk_per_trade": 0.01,
+    "price_diff_threshold": {"high_volatility": 0.005, "normal": 0.003},
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "stoch_overbought": 80,
+    "stoch_oversold": 20,
+    "adx_threshold": 25,
+    "obv_window": 14,
+    "capital": 10000,
+    "risk_percent": 0.01,
+    "atr_threshold": 0.02,
+    "min_backtest_days": 180
+}</code></pre>
+
+</body>
+</html>
