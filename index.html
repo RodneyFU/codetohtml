@@ -558,7 +558,7 @@ def py_to_html(root_dir: str = '.', output_file: str = 'index.html'):
                     dirs.remove(jump)
                     print(f"跳過根目錄的資料夾：{jump}")
             for file in files:
-                if file.endswith(('.py', '.json')) and not file.endswith(('py.py', 'txt.py')) and not file.startswith(('grafana_dashboard', 'api_key', 'data_fetcher', 'model')):
+                if file.endswith(('.py', '.json')) and not file.startswith(('grafana_dashboard', 'api_key', 'data_fetcher', 'model')):
                     path = os.path.join(subdir, file)
                     print(f"合併 Python/JSON 檔案：{path}")
                     py_json_content += f'        &lt;li&gt;&lt;h3&gt;File: {path}&lt;/h3&gt;\n'
@@ -988,7 +988,7 @@ def fill_missing_values(df: pd.DataFrame) -&gt; pd.DataFrame:
     logging.info("Missing values filled using forward and backward fill")
     return df
 async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, config: dict = None) -&gt; pd.DataFrame:
-    """計算技術指標：使用多線程計算 RSI, MACD, ATR, Stochastic, ADX, Ichimoku, Bollinger, EMA，支援分批計算並檢查重複。"""
+    """計算技術指標：使用多線程計算 RSI, MACD, ATR, Stochastic, ADX, Ichimoku, Bollinger, EMA，支援分批計算並檢查重複，並直接更新 ohlc TABLE 的指標列。"""
     try:
         # 動態數據長度檢查，根據時間框架設置最小數據長度
         min_data_length = {'1min': 200, '5min': 150, '1h': 100, '4h': 60, '1d': 60}
@@ -997,30 +997,27 @@ async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, con
             logging.warning(f"數據長度不足 ({len(df)} &lt; {required_length}) for timeframe {timeframe}，跳過指標計算")
             return df
 
-        # 檢查 SQLite 是否已存儲最新指標
+        # 從 ohlc TABLE 載入，若指標為 NaN 則計算
         async with aiosqlite.connect(db_path, timeout=10) as conn:
             cursor = await conn.execute(
-                "SELECT MAX(date) FROM indicators WHERE timeframe = ? AND indicator IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (timeframe, 'RSI', 'MACD', 'ATR', 'Stoch_k', 'ADX', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'BB_upper', 'EMA_12', 'EMA_26')
+                "SELECT * FROM ohlc WHERE timeframe = ? AND date &gt;= ?",
+                (timeframe, df['date'].min().strftime('%Y-%m-%d'))
             )
-            last_date = await cursor.fetchone()
-            last_date = pd.to_datetime(last_date[0]) if last_date[0] else None
-            if last_date and df['date'].max() &lt;= last_date:
-                logging.info(f"發現最新指標已存儲 for timeframe {timeframe}，從 SQLite 載入")
-                cursor = await conn.execute(
-                    "SELECT date, indicator, value FROM indicators WHERE timeframe = ? AND date &gt;= ?",
-                    (timeframe, df['date'].min().strftime('%Y-%m-%d'))
-                )
-                rows = await cursor.fetchall()
-                if rows:
-                    indicators_df = pd.DataFrame(rows, columns=['date', 'indicator', 'value'])
-                    indicators_df = indicators_df.pivot(index='date', columns='indicator', values='value')
-                    indicators_df['date'] = pd.to_datetime(indicators_df['date'])
-                    df = df.merge(indicators_df, on='date', how='left')
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            db_df = pd.DataFrame(rows, columns=columns)
+            db_df['date'] = pd.to_datetime(db_df['date'])
+            if not db_df.empty:
+                # merge 並檢查指標是否已計算 (若全 NaN 則重新計算)
+                df = df.merge(db_df, on=['date', 'timeframe'], how='left', suffixes=('', '_db'))
+                indicator_columns = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ATR', 'Stoch_k', 'ADX', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'Ichimoku_span_a', 'Ichimoku_span_b', 'Ichimoku_cloud_top', 'BB_upper', 'BB_middle', 'BB_lower', 'EMA_12', 'EMA_26']
+                if df[indicator_columns].isna().all().all():
+                    logging.info(f"ohlc TABLE 指標未計算 for timeframe {timeframe}，開始計算")
+                else:
                     df = fill_missing_values(df)
-                    return df
+                    return df[indicator_columns + ['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw', 'timeframe']]
 
-        # 分批計算（若數據量大）
+        # 分批計算並更新
         batch_size = 10000 if timeframe in ['1min', '5min'] else None
         if batch_size and len(df) &gt; batch_size:
             logging.info(f"數據量大 ({len(df)})，分批計算，batch_size={batch_size}")
@@ -1036,6 +1033,7 @@ async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, con
                 return rsi if rsi is not None else pd.Series(np.nan, index=df.index, name='RSI')
 
             def calc_macd(df):
+
                 macd = ta.macd(df['close'])
                 if macd is None:
                     return pd.DataFrame({'MACD': np.nan, 'MACD_signal': np.nan, 'MACD_hist': np.nan}, index=df.index)
@@ -1139,7 +1137,7 @@ async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, con
         df = pd.concat(result_dfs, ignore_index=True).drop_duplicates(subset=['date'])
 
         # 存入 DB
-        await save_data(df, timeframe, db_path, data_type='indicators')
+        await save_data(batch_df, timeframe, db_path, data_type='ohlc')  # 現在 ohlc 包含指標
         logging.info(f"指標數據已存入 DB: timeframe={timeframe}")
 
         # 存入 CSV
@@ -1150,7 +1148,7 @@ async def compute_indicators(df: pd.DataFrame, db_path: str, timeframe: str, con
             df.to_csv(indicators_csv_path, index=False)
             logging.info(f"指標數據已存入 CSV: {indicators_csv_path}")
 
-        return df
+        return batch_df
     except Exception as e:
         logging.error(f"指標計算錯誤: {str(e)}, timeframe={timeframe}, traceback={traceback.format_exc()}")
         return df
@@ -1462,6 +1460,7 @@ async def main(mode: str = 'backtest'):
                 task.cancel()
             return
         # 傳遞 db_path, timeframe, config 給 compute_indicators，讓其內部存入 DB 和 CSV
+        print(f"{tf} compute_indicators 資料處理")
         df = await compute_indicators(df, db_path, tf, config)
         data_frames[tf] = df
         print(f"{tf} 資料處理完成")
@@ -1504,14 +1503,15 @@ async def main(mode: str = 'backtest'):
         logging.warning("1h data or ATR column missing, defaulting to 'normal' session", extra={'mode': mode})
         session = 'normal'
     else:
-        if not check_volatility(data_frames['1h']['ATR'].mean(), threshold=trading_params['atr_threshold']):
-            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 高波动，暂停执行")
-            logging.warning("High volatility detected, halting execution", extra={'mode': mode})
-            for task in tasks:
-                task.cancel()
-            return
+        volatility_level = check_volatility(data_frames['1h']['ATR'].mean())
+        if volatility_level == 'high':
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 高波动，進入保守模式")
+            logging.warning("High volatility detected, entering conservative mode", extra={'mode': mode})
+            trading_params['risk_percent'] *= 0.5  # 減半風險
+            session = 'high_volatility'
+        else:
+            session = 'normal'
     # 模型更新與訓練
-    session = 'high_volatility' if data_frames['1h']['ATR'].iloc[-1] &gt; trading_params['atr_threshold'] else 'normal'
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 更新模型中")
     models = update_model(data_frames['1d'], 'models', session, device_config)
     if not models:
@@ -1604,6 +1604,34 @@ if __name__ == "__main__":
     args = parser.parse_args()
     asyncio.run(main(args.mode))</code></pre></li>
 
+        <li><h3>File: .\py_to_txt.py</h3>
+        <pre><code>import os
+
+def py_to_txt(root_dir: str = '.', output_file: str = 'all_code.txt'):
+    """將所有 PY 檔內容合併到 TXT。
+    邏輯：遍歷目錄，讀取 PY 檔，寫入 TXT 並標記檔名。
+    """
+
+    with open(output_file, 'w', encoding='utf-8') as out:
+        exclude = ['venv', 'test']
+        for subdir, dirs, files in os.walk(root_dir, topdown=True):
+            for jump in exclude:
+                if subdir==root_dir and jump in dirs:
+                    dirs.remove(jump)
+                    print(f"跳過根目錄的資料夾：{jump}")
+            for file in files:
+                if file.endswith(('.py', '.json')) and not file.endswith(('py.py','txt.py')) and not file.startswith(('grafana_dashboard','api_key','data_fetcher','model')):
+                    path = os.path.join(subdir, file)
+                    print(f"合併：{path}")
+                    out.write(f"---### {path} ###---\n")
+                    with open(path, 'r', encoding='utf-8') as f:
+                        out.write(f.read())
+                    out.write("\n\n")
+    print(f"合併完成：{output_file}")
+
+if __name__ == "__main__":
+    py_to_txt()</code></pre></li>
+
         <li><h3>File: .\risk_management.py</h3>
         <pre><code>import xgboost as xgb
 import pandas as pd
@@ -1672,9 +1700,9 @@ def check_resources(threshold_mem: float = 0.9, threshold_cpu: float = 80.0) -&g
     except Exception as e:
         logging.error(f"資源檢查錯誤: {e}")
         return False
-async def calculate_position_size(capital: float, risk_percent: float, stop_loss_distance: float, sentiment: float = 0.0, db_path: str = "C:\\Trading\\data\\trading_data.db") -&gt; float:
+async def calculate_position_size(capital: float, risk_percent: float, stop_loss_distance: float, sentiment: float = 0.0, db_path: str = "C:\\Trading\\data\\trading_data.db", volatility_level: str = 'normal') -&gt; float:
     """計算倉位大小：控制風險，檢查總持倉暴露（5% 資本）及槓桿限制（30:1）。"""
-    # 函數說明：計算交易倉位大小，考慮風險百分比、情緒調整和暴露限額。
+    # 函數說明：計算交易倉位大小，考慮風險百分比、情緒調整和暴露限額。高波動時減小倉位。
     try:
         if abs(sentiment) &gt; 0.8:
             logging.warning(f"極端情緒分數: {sentiment}，倉位大小設為 0")
@@ -1683,6 +1711,10 @@ async def calculate_position_size(capital: float, risk_percent: float, stop_loss
         base_size = (capital * risk_percent) / stop_loss_distance if stop_loss_distance &gt; 0 else 0
         adjustment = 1.2 if sentiment &gt; 0.4 else 0.8 if sentiment &lt; -0.4 else 1.0
         position_size = base_size * adjustment
+        # 高波動調整
+        if volatility_level == 'high':
+            position_size *= 0.5  # 減半倉位
+            logging.info("高波動模式，倉位減半")
         # 檢查總持倉暴露
         total_exposure = await get_current_exposure(db_path)
         max_exposure = capital * 0.05 # 最大暴露限額為資本的 5%
@@ -1716,6 +1748,65 @@ def predict_volatility(df: pd.DataFrame, model_path: str = 'models/lightgbm_mode
     except Exception as e:
         logging.error(f"波動預測錯誤: {e}")
         return df['ATR'].mean()</code></pre></li>
+
+        <li><h3>File: .\srt_to_html.py</h3>
+        <pre><code>import os
+import re
+import html
+
+def srt_to_html(root_dir: str = '.', output_file: str = 'subtitles.html'):
+    """將指定目錄中的 SRT 字幕檔案內容轉換為 HTML 格式。
+    邏輯：遍歷目錄，讀取 SRT 檔案，保留原始格式並寫入 HTML，使用 &lt;section&gt; 組織檔案。
+    """
+    html_content = """&lt;!DOCTYPE html&gt;
+&lt;html lang="zh-HK"&gt;
+&lt;head&gt;
+    &lt;meta charset="UTF-8"&gt;
+    &lt;meta name="viewport" content="width=device-width, initial-scale=1.0"&gt;
+    &lt;title&gt;Subtitles in HTML&lt;/title&gt;
+    &lt;style&gt;
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        h1 { color: #2c3e50; text-align: center; }
+        h2 { color: #34495e; margin-top: 20px; }
+        pre { background-color: #1e1e1e; color: #dcdcdc; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        code { font-family: 'Courier New', Courier, monospace; font-size: 14px; }
+        .srt-file { margin-bottom: 20px; }
+    &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+    &lt;h1&gt;Subtitles&lt;/h1&gt;
+"""
+    srt_content = ""
+    with open(output_file, 'w', encoding='utf-8') as out:
+        exclude = ['venv', 'test']
+        for subdir, dirs, files in os.walk(root_dir, topdown=True):
+            for jump in exclude:
+                if subdir == root_dir and jump in dirs:
+                    dirs.remove(jump)
+                    print(f"跳過根目錄的資料夾：{jump}")
+            for file in files:
+                if file.endswith('.srt'):
+                    path = os.path.join(subdir, file)
+                    print(f"處理 SRT 檔案：{path}")
+                    srt_content += f'&lt;section class="srt-file" data-filename="{file}"&gt;\n'
+                    srt_content += f'    &lt;h2&gt;SRT File: {file}&lt;/h2&gt;\n'
+                    srt_content += '    &lt;pre&gt;&lt;code&gt;'
+                    with open(path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        # Escape special characters to prevent HTML rendering issues
+                        content = html.escape(content)
+                        srt_content += content
+                    srt_content += '&lt;/code&gt;&lt;/pre&gt;\n'
+                    srt_content += '&lt;/section&gt;\n\n'
+        html_content += srt_content
+        html_content += """&lt;/body&gt;
+&lt;/html&gt;"""
+        out.write(html_content)
+   
+    print(f"轉換完成：{output_file}")
+
+if __name__ == "__main__":
+    srt_to_html()</code></pre></li>
 
         <li><h3>File: .\trading_strategy.py</h3>
         <pre><code>from stable_baselines3 import PPO
@@ -1952,6 +2043,48 @@ def execute_trade(ib, action: str, price: float, quantity: float, stop_loss: flo
             logging.error(f"交易執行錯誤: {e}, 重試 {attempt + 1}/3")
         ib.sleep(2 ** attempt * 2)
     logging.error("交易執行失敗，超過最大重試次數")</code></pre></li>
+
+        <li><h3>File: .\txt_to_py.py</h3>
+        <pre><code>import os
+import re
+
+def txt_to_py(input_file: str = 'all_code.txt', root_dir: str = '.'):
+    """將合併的 TXT 檔還原為原始的 PY 和 JSON 檔案。
+    邏輯：讀取 TXT 檔，根據 ### 標記分割內容，還原到原始路徑。
+    """
+    if not os.path.exists(input_file):
+        print(f"錯誤：找不到輸入檔案 {input_file}")
+        return
+
+    with open(input_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 使用正規表達式分割檔案內容，匹配 ### 路徑 ### 標記
+    sections = re.split(r'---###\s+(.+?)\s+###---\n', content)[1:]  # 跳過開頭空內容
+
+    # 每兩個元素為一組（路徑, 內容）
+    for i in range(0, len(sections), 2):
+        file_path = sections[i].strip()
+        file_content = sections[i + 1].strip()
+
+        # 確保目標目錄存在
+        directory = os.path.dirname(file_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+            print(f"建立目錄：{directory}")
+
+        # 寫入檔案
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(file_content)
+            print(f"還原檔案：{file_path}")
+        except Exception as e:
+            print(f"寫入檔案 {file_path} 失敗：{e}")
+
+    print(f"還原完成：所有檔案已從 {input_file} 還原到原始路徑")
+
+if __name__ == "__main__":
+    txt_to_py()</code></pre></li>
 
         <li><h3>File: .\utils.py</h3>
         <pre><code>import torch
@@ -2460,12 +2593,15 @@ def clear_proxy_cache():
     global _proxy_cache
     _proxy_cache = None
     logging.info("代理快取已清除")
-def check_volatility(atr: float, threshold: float = 0.02) -&gt; bool:
-    """檢查波動：若 ATR &gt; 閾值，暫停。"""
-    if atr &gt; threshold:
+def check_volatility(atr: float, low_threshold: float = 0.01, high_threshold: float = 0.02) -&gt; str:
+    """檢查波動：返回波動等級（'low'/'medium'/'high'）。"""
+    if atr &gt; high_threshold:
         logging.warning("高波動偵測")
-        return False
-    return True
+        return 'high'
+    elif atr &gt; low_threshold:
+        return 'medium'
+    else:
+        return 'low'
 def clear_config_cache():
     """清除配置快取。"""
     global _config_cache
