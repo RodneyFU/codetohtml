@@ -31,7 +31,7 @@ from textblob import TextBlob
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 import traceback
-from data_acquisition import fetch_sentiment_data                                                     
+from data_acquisition import fetch_news_data                                                     
 
 # 全局特徵常量，避免重複定義
 FEATURES = ['close', 'RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'Stoch_k', 'ADX', 'BB_upper', 'BB_lower', 'EMA_12', 'EMA_26', 'ATR', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'Ichimoku_span_a', 'Ichimoku_span_b', 'Ichimoku_cloud_top', 'fed_funds_rate']
@@ -227,13 +227,12 @@ def train_distilbert(df: pd.DataFrame, device=torch.device('cuda' if torch.cuda.
     try:
         tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
         model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased').to(device)
-        if 'tweets' not in df.columns or df['tweets'].dropna().empty:
-            logging.warning("df缺少'tweets'列或無有效推文數據，使用模擬數據 fallback")
-            # 修改：添加 fallback 模擬數據
-            texts = ["Positive sample tweet about USDJPY", "Negative sample tweet about Federal Reserve"] * 50
+        if 'news_content' not in df.columns or df['news_content'].dropna().empty:
+            logging.warning("df缺少'news_content'列或無有效新聞數據，使用模擬數據 fallback")
+            texts = ["Positive sample news about USDJPY", "Negative sample news about Federal Reserve"] * 50
             labels = [1, 0] * 50
         else:
-            texts = df['tweets'].dropna().tolist()[:100]
+            texts = df['news_content'].dropna().tolist()[:100]
             labels = [1 if TextBlob(text).sentiment.polarity > 0 else 0 for text in texts]
         if not texts or len(texts) != len(labels):
             logging.error("無效的文本或標籤數據")
@@ -253,48 +252,46 @@ def train_distilbert(df: pd.DataFrame, device=torch.device('cuda' if torch.cuda.
             'attention_mask': tokenizer(['dummy text'], return_tensors="pt", padding=True, truncation=True)['attention_mask'].to(device)
         }
         torch.onnx.export(model, (dummy_input['input_ids'], dummy_input['attention_mask']),
-                          "models/distilbert_model.onnx", input_names=["input_ids", "attention_mask"], output_names=["output"], opset_version=14)  # 修改 opset_version=14
-        convert_to_onnx(None, len(FEATURES), 'none', 'distilbert_model')  # 呼叫通用 ONNX 函數
+                          "models/distilbert_model.onnx", input_names=["input_ids", "attention_mask"], output_names=["output"], opset_version=14)
+        convert_to_onnx(None, len(FEATURES), 'none', 'distilbert_model')
         return model, tokenizer
     except Exception as e:
         logging.error(f"DistilBERT 訓練錯誤: {e}, traceback={traceback.format_exc()}")
         return None, None
 
 async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
-    """情緒分析：先從 DB/CSV 讀取推文，如果無數據再呼叫 fetch_sentiment_data 獲取，計算 polarity 並儲存結果及生成 CSV。"""
+    """情緒分析：先從 DB/CSV 讀取新聞，如果無數據再呼叫 fetch_news_data 獲取，計算 polarity 並儲存結果及生成 CSV。（調整為新聞）"""
     try:
-        # 先嘗試從 DB 讀取推文
         engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
-        query = text("SELECT * FROM tweets WHERE date = :date")
+        query = text("SELECT * FROM news WHERE date = :date")
         async with engine.connect() as conn:
             result = await conn.execute(query, {'date': date})
-            df_tweets = pd.DataFrame(result.fetchall(), columns=result.keys())
-        if not df_tweets.empty and 'text' in df_tweets.columns:
-            logging.info(f"從 DB 載入 tweets 數據: shape={df_tweets.shape}")
+            df_news = pd.DataFrame(result.fetchall(), columns=result.keys())
+        if not df_news.empty and 'news_content' in df_news.columns:
+            logging.info(f"從 DB 載入 news 數據: shape={df_news.shape}")
         else:
-            # DB 無數據，從 CSV 讀取
-            csv_path = Path(config['system_config']['root_dir']) / 'data' / 'tweets.csv'
+            csv_path = Path(config['system_config']['root_dir']) / 'data' / 'news.csv'
             if csv_path.exists():
-                df_tweets = pd.read_csv(csv_path, parse_dates=['date'])
-                df_tweets = df_tweets[df_tweets['date'] == pd.to_datetime(date)]
-                if not df_tweets.empty:
-                    logging.info(f"從 CSV 載入 tweets 數據: shape={df_tweets.shape}")
-                    await save_data(df_tweets, timeframe='1 day', db_path=db_path, data_type='tweets')  # 同步到 DB
+                df_news = pd.read_csv(csv_path, parse_dates=['date'])
+                df_news = df_news[df_news['date'] == pd.to_datetime(date)]
+                if not df_news.empty:
+                    logging.info(f"從 CSV 載入 news 數據: shape={df_news.shape}")
+                    await save_data(df_news, timeframe='1 day', db_path=db_path, data_type='news')
                 else:
-                    logging.warning("CSV 無匹配數據，呼叫 API 獲取")
-                    df_tweets = await fetch_sentiment_data(date, db_path, config)
+                    logging.warning("CSV 無匹配數據，呼叫 FCS API 獲取")
+                    df_news = await fetch_news_data(date, db_path, config)
             else:
-                logging.warning("無 CSV 檔案，呼叫 API 獲取")
-                df_tweets = await fetch_sentiment_data(date, db_path, config)
+                logging.warning("無 CSV 檔案，呼叫 FCS API 獲取")
+                df_news = await fetch_news_data(date, db_path, config)
         
-        if df_tweets.empty or 'text' not in df_tweets.columns:
-            logging.error("無有效推文數據可用，返回預設值 0.0")
+        if df_news.empty or 'news_content' not in df_news.columns:
+            logging.error("無有效新聞數據可用，返回預設值 0.0")
             return 0.0
         
         tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
         if not os.path.exists('models/distilbert_model.pth'):
             logging.warning("DistilBERT模型檔案不存在，嘗試重新訓練")
-            model, tokenizer = train_distilbert(df_tweets.rename(columns={'text': 'tweets'}), device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            model, tokenizer = train_distilbert(df_news.rename(columns={'news_content': 'news_content'}), device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
             if model is None:
                 logging.error("DistilBERT訓練失敗，使用TextBlob fallback")
                 model = None
@@ -305,12 +302,12 @@ async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
         model.to(device)
         model.eval()
         polarities = []
-        for tweet_text in df_tweets['text']:
-            inputs = tokenizer(tweet_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        for news_text in df_news['news_content']:
+            inputs = tokenizer(news_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
             with torch.no_grad():
                 outputs = model(**inputs).logits
             score = torch.softmax(outputs, dim=1)[0][1].item() - torch.softmax(outputs, dim=1)[0][0].item()
-            tb_polarity = TextBlob(tweet_text).sentiment.polarity
+            tb_polarity = TextBlob(news_text).sentiment.polarity
             combined_score = 0.7 * score + 0.3 * tb_polarity
             polarities.append(combined_score)
         if polarities:
@@ -318,10 +315,9 @@ async def predict_sentiment(date: str, db_path: str, config: dict) -> float:
             logging.info(f"計算平均 polarity 分數: {avg_score} (DistilBERT 70%, TextBlob 30%)")
         else:
             avg_score = 0.0
-            logging.warning("無推文數據，使用預設值 0.0")
+            logging.warning("無新聞數據，使用預設值 0.0")
         sentiment_df = pd.DataFrame({'date': [pd.to_datetime(date)], 'sentiment': [avg_score]})
         await save_data(sentiment_df, timeframe='1 day', db_path=db_path, data_type='sentiment')
-        # 生成 sentiment.csv
         sentiment_csv_path = Path(config['system_config']['root_dir']) / 'data' / 'sentiment.csv'
         sentiment_df.to_csv(sentiment_csv_path, mode='a', header=not sentiment_csv_path.exists(), index=False)
         logging.info(f"情緒數據已存入 CSV: {sentiment_csv_path}")
@@ -468,6 +464,8 @@ import logging
 import numpy as np
 import traceback
 import time
+import hashlib
+from cryptography.fernet import Fernet
 
 # 設置環境變數以禁用 TensorFlow oneDNN 自訂運算
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -492,89 +490,106 @@ class RateLimiter:
 
 polygon_rate_limiter = RateLimiter(calls=5, period=60.0)
 
-async def fetch_sentiment_data(date: str, db_path: str, config: dict) -> pd.DataFrame:
-    """從 X API 獲取推文並儲存到 SQLite 的 tweets 表。（優化：合併重複的錯誤處理）"""
+async def fetch_news_data(date: str, db_path: str, config: dict) -> pd.DataFrame:
+    """從 FCS NEWS ENDPOINT 獲取新聞並儲存到 SQLite 的 news 表。"""
     try:
         end_date = pd.to_datetime(date)
         start_date = end_date - timedelta(days=1)
-        start_time = start_date.strftime('%Y-%m-%dT00:00:00Z')
-        # 修改：將 end_time 設為比當前時間早 10 秒
-        current_time = datetime.utcnow()
-        end_time = (current_time - timedelta(seconds=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        logging.info(f"設置 API 請求時間範圍: start_time={start_time}, end_time={end_time}")
-        X_BEARER_TOKEN = config['api_key'].get('x_bearer_token', '')
-        if not X_BEARER_TOKEN:
-            logging.error("X Bearer Token 未配置")
+        start_time = start_date.strftime('%Y-%m-%d')
+        end_time = end_date.strftime('%Y-%m-%d')
+        logging.info(f"設置 FCS NEWS 請求時間範圍: start_time={start_time}, end_time={end_time}")
+
+        # 獲取 FCS API Key 並解密
+        encrypted_api_key = config.get('api_key', {}).get('fcs_api_key', '')
+        if not encrypted_api_key:
+            logging.error("FCS API Key 未配置，請檢查 config['api_key']['fcs_api_key']")
             return pd.DataFrame()
-        # 新增：從 DB 取 max tweet_id 作為 since_id
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
-        async with engine.connect() as conn:
-            result = await conn.execute(text("SELECT MAX(tweet_id) as max_id FROM tweets WHERE date >= :start_date"), {'start_date': start_date.strftime('%Y-%m-%d')})
-            row = result.fetchone()
-            since_id = row[0] if row[0] else None
-        logging.info(f"從 DB 取 since_id: {since_id or '無'}")
-        url = "https://api.x.com/2/tweets/search/recent"
-        headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}"}
+
+        # 確保加密的 API 金鑰是字節串
+        if isinstance(encrypted_api_key, str):
+            encrypted_api_key = encrypted_api_key.encode()
+        elif not isinstance(encrypted_api_key, bytes):
+            logging.error(f"FCS API Key 格式錯誤，應為字節串或字符串，實際為 {type(encrypted_api_key)}")
+            return pd.DataFrame()
+
+        # 使用 utils.py 中的 cipher 進行解密
+        from utils import cipher
+        try:
+            fcs_api_key = cipher.decrypt(encrypted_api_key).decode()  # 解密 API 金鑰
+        except Exception as e:
+            logging.error(f"API 金鑰解密失敗: {str(e)}, traceback={traceback.format_exc()}")
+            return pd.DataFrame()
+
+        # FCS API 端點和參數
+        url = "https://fcsapi.com/api-v3/news/news"
+        headers = {}  # FCS 通常無需特殊 headers
         params = {
-            'query': "(USDJPY OR USD/JPY OR 'Federal Reserve') AND lang:en",
-            'start_time': start_time,
-            'end_time': end_time,
-            'max_results': 100,
-            'expansions': 'author_id',  # 新增：獲取 user 資訊
-            'tweet.fields': 'id,text,created_at',
-            'user.fields': 'id,username,verified'
+            'access_key': fcs_api_key,  # 使用解密的 API 金鑰
+            'find': '+USD +JPY +Federal +Reserve',  # 確保所有詞出現
+            'from': start_time,
+            'to': end_time,
+            'language': 'en',
+            'sortby': 'latest',
+            'force_update': '1'  # 可選，確保最新但多 1 credit
         }
-        if since_id:
-            params['since_id'] = since_id  # 只取新推文
-        tweets = []
-        users = []  # 新增：存 users
-        total_posts = 0
-        next_token = None
-        while True:  # 新增：分頁 loop
-            if next_token:
-                params['next_token'] = next_token
-            data = await fetch_api_data(url, headers=headers, params=params)
-            if 'data' not in data or not data['data']:
-                logging.warning(f"X API 數據為空或格式錯誤: {data}")
-                break
-            total_posts += len(data['data'])
-            if total_posts > 100:  # 限每月配額，避免超
-                logging.warning(f"已達 100 Posts 上限，停止分頁")
-                break
-            for tweet in data['data']:
-                tweets.append({
-                    'date': end_date,
-                    'tweet_id': tweet['id'],
-                    'text': tweet['text'],
-                    'user_id': tweet['author_id']  # 新增
-                })
-            # 新增：處理 includes.users
-            if 'includes' in data and 'users' in data['includes']:
-                for user in data['includes']['users']:
-                    users.append({
-                        'user_id': user['id'],
-                        'username': user['username'],
-                        'verified': user.get('verified', False)
-                    })
-            next_token = data.get('meta', {}).get('next_token')
-            if not next_token:
-                break
-            await asyncio.sleep(1)  # 避免速率過快
-        tweets_df = pd.DataFrame(tweets)
-        users_df = pd.DataFrame(users).drop_duplicates(subset=['user_id'])  # 去重
-        if not tweets_df.empty:
-            await save_data(tweets_df, timeframe='1 day', db_path=db_path, data_type='tweets')
-            await save_data(users_df, timeframe='1 day', db_path=db_path, data_type='users')  # 新增存 users
-            logging.info(f"儲存 {len(tweets_df)} 條推文和 {len(users_df)} 位用戶到 SQLite")
-            # 生成 tweets.csv
-            tweets_csv_path = Path(config['system_config']['root_dir']) / 'data' / 'tweets.csv'
-            tweets_df.to_csv(tweets_csv_path, mode='a', header=not tweets_csv_path.exists(), index=False)
-            logging.info(f"推文數據已存入 CSV: {tweets_csv_path}")
-        else:
-            logging.warning("無推文數據")
-        return tweets_df
+
+        # 調用 fetch_api_data（假設其為異步 GET 請求）
+        data = await fetch_api_data(url, headers=headers, params=params)
+        
+        # 檢查 API 響應
+        if not data or data.get('status') is False:
+            logging.warning(f"FCS NEWS API 數據為空或格式錯誤: {data}")
+            if data.get('code') == 104:
+                logging.error("FCS API 錯誤: 無效的 access_key 或未授權的 IP。請檢查 FCS 控制台中的 API 金鑰和 IP 白名單設置。")
+            return pd.DataFrame()
+
+        if 'response' not in data or not data['response']:
+            logging.warning(f"FCS NEWS API 未返回有效新聞數據: {data}")
+            return pd.DataFrame()
+
+        # 處理新聞數據
+        news_list = []
+        for item in data['response']:
+            title = item.get('title', '')
+            description = item.get('description', '')
+            content = item.get('content', '')
+            published_at = item.get('publishedAt', '')
+            if not published_at:
+                logging.warning(f"新聞項目缺少 publishedAt: {title[:50]}...")
+                continue
+            news_content = f"{title} {description} {content}".strip()
+            news_id = hashlib.md5((title + published_at).encode()).hexdigest()  # 生成唯一 ID
+            news_list.append({
+                'date': pd.to_datetime(published_at, errors='coerce'),
+                'news_id': news_id,
+                'news_content': news_content,
+                'source': item.get('source', 'FCS')
+            })
+
+        news_df = pd.DataFrame(news_list)
+        if news_df.empty:
+            logging.warning("無有效新聞數據可儲存")
+            return pd.DataFrame()
+
+        # 移除無效日期
+        invalid_dates = news_df[news_df['date'].isna()]
+        if not invalid_dates.empty:
+            logging.warning(f"檢測到 {len(invalid_dates)} 條無效日期新聞，已移除")
+            news_df = news_df.dropna(subset=['date'])
+
+        # 儲存到 SQLite
+        await save_data(news_df, timeframe='1 day', db_path=db_path, data_type='news')
+        logging.info(f"儲存 {len(news_df)} 條新聞到 SQLite")
+
+        # 儲存到 CSV
+        news_csv_path = Path(config['system_config']['root_dir']) / 'data' / 'news.csv'
+        news_df.to_csv(news_csv_path, mode='a', header=not news_csv_path.exists(), index=False)
+        logging.info(f"新聞數據已存入 CSV: {news_csv_path}")
+
+        return news_df
+
     except Exception as e:
-        logging.error(f"推文數據獲取錯誤: {str(e)}, traceback={traceback.format_exc()}")
+        logging.error(f"新聞數據獲取錯誤: {str(e)}, traceback={traceback.format_exc()}")
         return pd.DataFrame()
 
 def normalize_timeframe(tf: str) -> str:
@@ -1725,6 +1740,15 @@ async def initialize_db(db_path: str):
                 )
             """))
             await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS news (
+                    date DATETIME,
+                    news_id TEXT,
+                    news_content TEXT,
+                    source TEXT,
+                    PRIMARY KEY (date, news_id)
+                )
+            """))
+            await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp DATETIME,
@@ -1811,6 +1835,13 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
                     Column('verified', Integer),
                     schema=None
                 ),
+                'news': Table('news', metadata,
+                    Column('date', DateTime),
+                    Column('news_id', Text),
+                    Column('news_content', Text),
+                    Column('source', Text),
+                    schema=None
+                ),
                 'trades': Table('trades', metadata,
                     Column('id', Integer, primary_key=True, autoincrement=True),
                     Column('timestamp', DateTime),
@@ -1836,6 +1867,7 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
                 'sentiment': ['date', 'sentiment'],
                 'tweets': ['date', 'tweet_id', 'text', 'user_id'],
                 'users': ['user_id', 'username', 'verified'],
+                'news': ['date', 'news_id', 'news_content', 'source'],
                 'trades': ['id', 'timestamp', 'symbol', 'price', 'action', 'volume', 'stop_loss', 'take_profit']
             }
             columns = column_maps.get(data_type, [])
