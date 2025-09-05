@@ -498,33 +498,16 @@ async def fetch_news_data(date: str, db_path: str, config: dict) -> pd.DataFrame
         start_time = start_date.strftime('%Y-%m-%d')
         end_time = end_date.strftime('%Y-%m-%d')
         logging.info(f"設置 FCS NEWS 請求時間範圍: start_time={start_time}, end_time={end_time}")
-
-        # 獲取 FCS API Key 並解密
-        encrypted_api_key = config.get('api_key', {}).get('fcs_api_key', '')
-        if not encrypted_api_key:
+        fcs_api_key = config.get('api_key', {}).get('fcs_api_key', '')
+        if not fcs_api_key:
             logging.error("FCS API Key 未配置，請檢查 config['api_key']['fcs_api_key']")
-            return pd.DataFrame()
-
-        # 確保加密的 API 金鑰是字節串
-        if isinstance(encrypted_api_key, str):
-            encrypted_api_key = encrypted_api_key.encode()
-        elif not isinstance(encrypted_api_key, bytes):
-            logging.error(f"FCS API Key 格式錯誤，應為字節串或字符串，實際為 {type(encrypted_api_key)}")
-            return pd.DataFrame()
-
-        # 使用 utils.py 中的 cipher 進行解密
-        from utils import cipher
-        try:
-            fcs_api_key = cipher.decrypt(encrypted_api_key).decode()  # 解密 API 金鑰
-        except Exception as e:
-            logging.error(f"API 金鑰解密失敗: {str(e)}, traceback={traceback.format_exc()}")
             return pd.DataFrame()
 
         # FCS API 端點和參數
         url = "https://fcsapi.com/api-v3/news/news"
         headers = {}  # FCS 通常無需特殊 headers
         params = {
-            'access_key': fcs_api_key,  # 使用解密的 API 金鑰
+            'access_key': fcs_api_key,
             'find': '+USD +JPY +Federal +Reserve',  # 確保所有詞出現
             'from': start_time,
             'to': end_time,
@@ -797,8 +780,6 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     for col in numeric_columns:
         if col in df.columns:
             df[col] = df[col].ffill().bfill()
-    if 'fed_funds_rate' in df.columns:
-        df['fed_funds_rate'] = df['fed_funds_rate'].ffill().bfill()
     logging.info("Missing values filled")
     return df
 
@@ -891,8 +872,101 @@ async def import_from_csv(file_name: str, db_path: str, timeframe: str):
         logging.error(f"從 CSV 匯入失敗: {str(e)}, traceback={traceback.format_exc()}")
         return False
 
+async def fetch_fed_funds_rate(date_range: dict, db_path: str, config: dict) -> pd.DataFrame:
+    """獲取聯邦基金利率數據並每日填充，存到 fed_funds_rate 表。（新函數）"""
+    CSV_PATH = Path(config['system_config']['root_dir']) / 'data' / 'fed_funds_rate.csv'
+    start_date = pd.to_datetime(date_range['start']) - timedelta(days=7)
+    end_date = pd.to_datetime(date_range['end']) + timedelta(days=7)
+    try:
+        # 使用非同步 SQLAlchemy 連線
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+        query = text("SELECT * FROM fed_funds_rate WHERE date BETWEEN :start_date AND :end_date")
+        async with engine.connect() as conn:
+            result = await conn.execute(query, {'start_date': start_date.strftime('%Y-%m-%d'), 'end_date': end_date.strftime('%Y-%m-%d')})
+            df = pd.DataFrame(result.fetchall(), columns=result.keys())
+            df['date'] = pd.to_datetime(df['date'])
+            if not df.empty:
+                df = filter_future_dates(df)
+                df = fill_missing_values(df)
+                logging.info(f"Loaded fed_funds_rate from SQLite: shape={df.shape}")
+                return df[['date', 'fed_funds_rate']]
+    except Exception as e:
+        logging.error(f"SQLite fed_funds_rate query failed: {str(e)}, traceback={traceback.format_exc()}")
+
+    try:
+        fred_api_key = config['api_key'].get('fred_api_key', '')
+        if not fred_api_key:
+            logging.error("FRED API key not configured")
+        else:
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=EFFR&api_key={fred_api_key}&file_type=json&observation_start={start_date.strftime('%Y-%m-%d')}&observation_end={end_date.strftime('%Y-%m-%d')}"
+            async with aiohttp.ClientSession() as session:
+                async with (await make_get_request(session, url, timeout=10)) as response:
+                    data = await response.json()
+                    if 'observations' not in data:
+                        logging.warning("FRED API returned no observations")
+                        fred_data = pd.DataFrame()
+                    else:
+                        fred_data = pd.DataFrame(data['observations'])[['date', 'value']].rename(columns={'value': 'fed_funds_rate'})
+                        fred_data['date'] = pd.to_datetime(fred_data['date'])
+                        fred_data['fed_funds_rate'] = pd.to_numeric(fred_data['fed_funds_rate'], errors='coerce')
+                        # 生成每日範圍並ffill
+                        daily_df = pd.DataFrame({'date': pd.date_range(start=start_date, end=end_date)})
+                        fred_data = daily_df.merge(fred_data, on='date', how='left')
+                        fred_data['fed_funds_rate'] = fred_data['fed_funds_rate'].ffill().bfill().fillna(0.0)
+                        df = fred_data
+    except Exception as e:
+        logging.error(f"Failed to fetch FRED API data: {str(e)}, traceback={traceback.format_exc()}")
+        df = pd.DataFrame()
+
+    # 若 df 仍空，從 DB 最後 rate 填充每日 df
+    if df.empty:
+        try:
+            engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
+            query = text("SELECT date, fed_funds_rate FROM fed_funds_rate WHERE fed_funds_rate IS NOT NULL ORDER BY date DESC LIMIT 1")
+            async with engine.connect() as conn:
+                result = await conn.execute(query)
+                row = result.fetchone()
+                if row:
+                    last_date, last_rate = pd.to_datetime(row[0]), row[1]
+                    df = pd.DataFrame({'date': pd.date_range(start=start_date, end=end_date)})
+                    df['fed_funds_rate'] = last_rate
+                    logging.info(f"API 無數據，使用 DB 最後 fed_funds_rate {last_rate} (from {last_date}) 填充 {len(df)} 天")
+                else:
+                    logging.warning("DB 無歷史 fed_funds_rate，無法填充")
+        except Exception as e:
+            logging.error(f"從 DB fallback fed_funds_rate 失敗: {str(e)}, traceback={traceback.format_exc()}")
+
+    if not df.empty:
+        df = df.drop_duplicates(subset=['date'], keep='last')
+        df = filter_future_dates(df)
+        df = fill_missing_values(df)
+        await save_data(df, timeframe='1 day', db_path=db_path, data_type='fed_funds')
+        logging.info(f"Fed funds rate data saved to SQLite: shape={df.shape}")
+        if not os.path.exists(CSV_PATH.parent):
+            os.makedirs(CSV_PATH.parent)
+        df.to_csv(CSV_PATH, index=False)
+        logging.info(f"Fed funds rate data saved to CSV: {CSV_PATH}")
+        return df[['date', 'fed_funds_rate']]
+    logging.info("No FRED data, trying to load from CSV")
+    if CSV_PATH.exists():
+        df = pd.read_csv(CSV_PATH)
+        required_columns = ['date', 'fed_funds_rate']
+        if all(col in df.columns for col in required_columns):
+            df['date'] = pd.to_datetime(df['date'])
+            df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+            df = df.drop_duplicates(subset=['date'], keep='last')
+            df = filter_future_dates(df)
+            df = fill_missing_values(df)
+            await save_data(df, timeframe='1 day', db_path=db_path, data_type='fed_funds')
+            logging.info(f"Loaded and saved fed funds rate from CSV: shape={df.shape}")
+            return df[['date', 'fed_funds_rate']]
+        else:
+            logging.warning(f"Invalid or missing columns in {CSV_PATH}, columns={df.columns.tolist()}")
+    logging.warning("Fed funds rate is empty")
+    return pd.DataFrame()
+
 async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) -> pd.DataFrame:
-    """獲取經濟日曆數據並儲存到 SQLite，新增 FRED API 獲取聯邦基金利率。（優化：合併 API 錯誤處理）"""
+    """獲取經濟日曆數據（僅事件）並儲存到 SQLite。"""
     CSV_PATH = Path(config['system_config']['root_dir']) / 'data' / 'economic_calendar.csv'
     start_date = pd.to_datetime(date_range['start']) - timedelta(days=7)
     end_date = pd.to_datetime(date_range['end']) + timedelta(days=7)
@@ -908,9 +982,10 @@ async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) 
                 df = filter_future_dates(df)
                 df = fill_missing_values(df)
                 logging.info(f"Loaded economic calendar from SQLite: shape={df.shape}")
-                return df[['date', 'event', 'impact', 'fed_funds_rate']]
+                return df[['date', 'event', 'impact']]
     except Exception as e:
         logging.error(f"SQLite economic calendar query failed: {str(e)}, traceback={traceback.format_exc()}")
+
     try:
         importances = ['high', 'medium']
         time_zone = 'GMT +8:00'
@@ -930,45 +1005,19 @@ async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) 
     except Exception as e:
         logging.error(f"Failed to fetch investpy economic calendar: {str(e)}, traceback={traceback.format_exc()}")
         df = pd.DataFrame()
-    try:
-        fred_api_key = config['api_key'].get('fred_api_key', '')
-        if not fred_api_key:
-            logging.error("FRED API key not configured")
-        else:
-            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=FEDFUNDS&api_key={fred_api_key}&file_type=json&observation_start={start_date.strftime('%Y-%m-%d')}&observation_end={end_date.strftime('%Y-%m-%d')}"
-            async with aiohttp.ClientSession() as session:
-                async with (await make_get_request(session, url, timeout=10)) as response:
-                    data = await response.json()
-                    if 'observations' not in data:
-                        logging.warning("FRED API returned no observations")
-                    else:
-                        fred_data = pd.DataFrame(data['observations'])[['date', 'value']].rename(columns={'value': 'fed_funds_rate'})
-                        fred_data['date'] = pd.to_datetime(fred_data['date'])
-                        fred_data['fed_funds_rate'] = fred_data['fed_funds_rate'].astype(float)
-                        if not df.empty:
-                            df = df.merge(fred_data[['date', 'fed_funds_rate']], on='date', how='left')
-                        else:
-                            df = fred_data[['date', 'fed_funds_rate']]
-                            df['event'] = 'FEDFUNDS'
-                            df['impact'] = 'High'
-    except Exception as e:
-        logging.error(f"Failed to fetch FRED API data: {str(e)}, traceback={traceback.format_exc()}")
+
     if not df.empty:
         df = df.drop_duplicates(subset=['date', 'event'], keep='last')
         df = filter_future_dates(df)
         df = fill_missing_values(df)
-        # 修改：確保 'fed_funds_rate' 存在並填充
-        if 'fed_funds_rate' not in df.columns:
-            df['fed_funds_rate'] = np.nan  # 讓 DB default 處理
-            logging.warning("economic_calendar 缺少 'fed_funds_rate'，依賴 DB default")
         await save_data(df, timeframe='1 day', db_path=db_path, data_type='economic')
         logging.info(f"Economic calendar data saved to SQLite: shape={df.shape}")
         if not os.path.exists(CSV_PATH.parent):
             os.makedirs(CSV_PATH.parent)
         df.to_csv(CSV_PATH, index=False)
         logging.info(f"Economic calendar data saved to CSV: {CSV_PATH}")
-        return df[['date', 'event', 'impact', 'fed_funds_rate']]
-    logging.info("No investpy/FRED data, trying to load from CSV")
+        return df[['date', 'event', 'impact']]
+    logging.info("No investpy data, trying to load from CSV")
     if CSV_PATH.exists():
         df = pd.read_csv(CSV_PATH)
         required_columns = ['date', 'event', 'impact']
@@ -978,12 +1027,9 @@ async def fetch_economic_calendar(date_range: dict, db_path: str, config: dict) 
             df = df.drop_duplicates(subset=['date', 'event'], keep='last')
             df = filter_future_dates(df)
             df = fill_missing_values(df)
-            if 'fed_funds_rate' not in df.columns:
-                df['fed_funds_rate'] = np.nan  # 讓 DB default 處理
-                logging.warning("CSV 缺少 'fed_funds_rate'，依賴 DB default")
             await save_data(df, timeframe='1 day', db_path=db_path, data_type='economic')
             logging.info(f"Loaded and saved economic calendar from CSV: shape={df.shape}")
-            return df[['date', 'event', 'impact', 'fed_funds_rate']]
+            return df[['date', 'event', 'impact']]
         else:
             logging.warning(f"Invalid or missing columns in {CSV_PATH}, columns={df.columns.tolist()}")
     logging.warning("Economic calendar is empty")
@@ -1003,7 +1049,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from data_acquisition import fetch_data, compute_indicators, fetch_economic_calendar
+from data_acquisition import fetch_data, compute_indicators, fetch_economic_calendar, fetch_fed_funds_rate
 from ai_models import update_model, predict_sentiment, integrate_sentiment
 from trading_strategy import ForexEnv, train_ppo, make_decision, backtest, connect_ib, execute_trade
 from risk_management import calculate_stop_loss, calculate_take_profit, calculate_position_size, predict_volatility
@@ -1120,22 +1166,29 @@ async def main(mode: str = 'backtest'):
             data_frames[tf] = data_frames[tf][data_frames[tf]['date'].isin(common_dates)].copy()
             logging.info(f"Aligned {tf} data to common dates, rows={len(data_frames[tf])}")
     economic_calendar = await fetch_economic_calendar(date_range, db_path, config)
+    fed_df = await fetch_fed_funds_rate(date_range, db_path, config)
     if not economic_calendar.empty:
         logging.info("Economic calendar is not empty", extra={'mode': mode})
+        # 修改：使用 dt.date 作為 merge key，避免時間不匹配
+        economic_calendar['date_day'] = economic_calendar['date'].dt.date
+        for tf in timeframes:
+            data_frames[tf]['date_day'] = data_frames[tf]['date'].dt.date
+            data_frames[tf] = data_frames[tf].merge(
+                economic_calendar[['date_day', 'event', 'impact']], on='date_day', how='left'
+            )
+            data_frames[tf].drop('date_day', axis=1, inplace=True)
+            data_frames[tf]['impact'] = data_frames[tf]['impact'].fillna('Low')
+    if not fed_df.empty:
+        logging.info("Fed funds rate is not empty", extra={'mode': mode})
         for tf in timeframes:
             data_frames[tf] = data_frames[tf].merge(
-                economic_calendar[['date', 'event', 'impact', 'fed_funds_rate']], on='date', how='left'
+                fed_df[['date', 'fed_funds_rate']], on='date', how='left'
             )
-            data_frames[tf]['impact'] = data_frames[tf]['impact'].fillna('Low')
-            # 修改：檢查 'fed_funds_rate' 是否存在，避免 KeyError
-            if 'fed_funds_rate' in data_frames[tf].columns:
-                data_frames[tf]['fed_funds_rate'] = data_frames[tf]['fed_funds_rate'].ffill().bfill()
-            else:
-                data_frames[tf]['fed_funds_rate'] = np.nan  # 讓 DB default 處理
-                logging.warning(f"{tf} data 缺少 'fed_funds_rate' 欄位，依賴 DB default")
-    # 修改：只在 LIVE 模式下創建定期保存 tasks
-    if mode == 'live':
-        tasks = [asyncio.create_task(save_periodically(data_frames[tf], tf, db_path, system_config['root_dir'], data_type=dtype)) for tf in timeframes for dtype in ('ohlc',) if not data_frames[tf].empty] + [asyncio.create_task(save_periodically(economic_calendar, '1d', db_path, system_config['root_dir'], 'economic'))] if not economic_calendar.empty else []
+            data_frames[tf]['fed_funds_rate'] = data_frames[tf]['fed_funds_rate'].ffill().bfill().fillna(0)
+    else:
+        for tf in timeframes:
+            data_frames[tf]['fed_funds_rate'] = np.nan
+            logging.warning(f"{tf} data 缺少 'fed_funds_rate' 欄位，依賴 DB default")
     clean_old_backups(system_config['root_dir'])
     logging.info("Old backup files cleaned", extra={'mode': mode})
     session = 'normal'
@@ -1150,7 +1203,11 @@ async def main(mode: str = 'backtest'):
         logging.error("Model update failed", extra={'mode': mode})
         [task.cancel() for task in tasks]
         return
-    sentiment_score = await predict_sentiment(date_range['end'], db_path, config)
+    if mode == 'live':
+        sentiment_score = await predict_sentiment(date_range['end'], db_path, config)
+    else:
+        sentiment_score = 0.0
+        logging.info("Backtest 模式，忽略情緒分析，使用預設 sentiment_score=0.0", extra={'mode': mode})
     sentiment_adjustment = integrate_sentiment(sentiment_score)
     logging.info(f"Sentiment analysis result: score={sentiment_score}, adjustment={sentiment_adjustment}", extra={'mode': mode})
     env = ForexEnv(data_frames)
@@ -1158,7 +1215,7 @@ async def main(mode: str = 'backtest'):
     logging.info("PPO model training completed", extra={'mode': mode})
     action = make_decision(ppo_model, data_frames, sentiment_score)
     logging.info(f"Trading decision: {action}", extra={'mode': mode})
-    if '1h' not in data_frames or data_frames['1h'].empty or 'ATR' in data_frames['1h'].columns or 'close' in data_frames['1h'].columns:
+    if '1h' not in data_frames or data_frames['1h'].empty or 'ATR' not in data_frames['1h'].columns or 'close' not in data_frames['1h'].columns:
         logging.error("1h data or required columns missing, cannot proceed with risk management", extra={'mode': mode})
         [task.cancel() for task in tasks]
         return
@@ -1175,8 +1232,8 @@ async def main(mode: str = 'backtest'):
         [task.cancel() for task in tasks]
         return
     if mode == 'backtest':
-        async def async_strategy(row):
-            return make_decision(ppo_model, data_frames, sentiment_score)
+        async def async_strategy(row, step):
+            return make_decision(ppo_model, data_frames, 0.0, step=step)  # 在回測中放棄考慮市場情緒，強制sentiment=0.0，並傳遞步驟索引
         result = await backtest(data_frames['1d'], async_strategy, trading_params['capital'])
         logging.info(f"Backtest Results: {result}", extra={'mode': 'backtest'})
         report_dir = Path('reports')
@@ -1184,6 +1241,7 @@ async def main(mode: str = 'backtest'):
         pd.DataFrame([result]).to_csv(report_dir / f'backtest_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv', index=False)
         logging.info("Backtest completed, report generated", extra={'mode': 'backtest'})
     elif mode == 'live':
+        tasks = [asyncio.create_task(save_periodically(data_frames[tf], tf, db_path, system_config['root_dir'], data_type=dtype)) for tf in timeframes for dtype in ('ohlc',) if not data_frames[tf].empty] + [asyncio.create_task(save_periodically(economic_calendar, '1d', db_path, system_config['root_dir'], 'economic'))] if not economic_calendar.empty else []
         ib = connect_ib()
         trade_counter.labels(action=action, mode=mode).inc()
         execute_trade(ib, action, current_price, position_size, stop_loss, take_profit)
@@ -1342,12 +1400,13 @@ import pandas as pd
 from ib_insync import IB, Forex, BracketOrder
 import logging
 from risk_management import check_resources, calculate_stop_loss, calculate_position_size
-from utils import load_settings
+from utils import load_settings, save_data
 from ai_models import FEATURES
 import torch
 import traceback
 import asyncio
 import json
+import uuid  # 生成 backtest_id
 
 class ForexEnv(gym.Env):
     """外匯環境：用於 PPO 強化學習訓練。"""
@@ -1400,8 +1459,8 @@ def train_ppo(env, device_config: dict = None):
         logging.error(f"PPO 訓練錯誤: {e}, traceback={traceback.format_exc()}")
         return None
 
-def make_decision(model, data_frames: dict, sentiment: float) -> str:
-    """產生決策，並記錄詳細原因。"""
+def make_decision(model, data_frames: dict, sentiment: float, step: int = None) -> str:
+    """產生決策，並記錄詳細原因。支援歷史步驟索引以用於回測。"""
     try:
         if not check_resources():
             logging.warning("資源不足，決策為持有", extra={'mode': 'decision'})
@@ -1412,8 +1471,8 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
             print("決策：持有，原因：PPO 模型未正確加載")
             return "持有"
         
-        buy_signals = []
-        sell_signals = []
+        buy_scores = []
+        sell_scores = []
         decision_log = {"buy_signals": {}, "sell_signals": {}, "ppo_action": "", "sentiment_adjust": 0.0}
         
         for tf in ['1h', '4h', '1d']:
@@ -1423,20 +1482,50 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
                 decision_log[tf] = {"status": "skipped", "reason": "數據缺失或欄位不全"}
                 continue
             
-            rsi, macd, macd_signal, stoch_k, adx = df[['RSI', 'MACD', 'MACD_signal', 'Stoch_k', 'ADX']].iloc[-1]
-            ichimoku_buy = (df['Ichimoku_tenkan'].iloc[-1] > df['Ichimoku_kijun'].iloc[-1] and df['close'].iloc[-1] > df['Ichimoku_cloud_top'].iloc[-1])
-            ichimoku_sell = (df['Ichimoku_tenkan'].iloc[-1] < df['Ichimoku_kijun'].iloc[-1] and df['close'].iloc[-1] < df['Ichimoku_cloud_top'].iloc[-1])
-            bb_buy = df['close'].iloc[-1] < df['BB_lower'].iloc[-1]
-            bb_sell = df['close'].iloc[-1] > df['BB_upper'].iloc[-1]
-            ema_signal = df['EMA_12'].iloc[-1] > df['EMA_26'].iloc[-1]
-            economic_impact = df['impact'].iloc[-1] if 'impact' in df.columns and not pd.isna(df['impact'].iloc[-1]) else 'Low'
-            economic_pause = economic_impact in ['High', 'Medium']
+            idx = step if step is not None else -1
+            rsi, macd, macd_signal, stoch_k, adx = df[['RSI', 'MACD', 'MACD_signal', 'Stoch_k', 'ADX']].iloc[idx]
+            ichimoku_buy = (df['Ichimoku_tenkan'].iloc[idx] > df['Ichimoku_kijun'].iloc[idx] and df['close'].iloc[idx] > df['Ichimoku_cloud_top'].iloc[idx])
+            ichimoku_sell = (df['Ichimoku_tenkan'].iloc[idx] < df['Ichimoku_kijun'].iloc[idx] and df['close'].iloc[idx] < df['Ichimoku_cloud_top'].iloc[idx])
+            bb_buy = df['close'].iloc[idx] < df['BB_lower'].iloc[idx]
+            bb_sell = df['close'].iloc[idx] > df['BB_upper'].iloc[idx]
+            ema_signal = df['EMA_12'].iloc[idx] > df['EMA_26'].iloc[idx]
+            economic_impact = df['impact'].iloc[idx] if 'impact' in df.columns and not pd.isna(df['impact'].iloc[idx]) else 'Low'
+            economic_pause = economic_impact == 'High'
             
-            buy_condition = (rsi < 30 and macd > macd_signal and stoch_k < 20 and adx > 25 and ichimoku_buy and bb_buy and ema_signal and not economic_pause)
-            sell_condition = (rsi > 70 and macd < macd_signal and stoch_k > 80 and adx > 25 and ichimoku_sell and bb_sell and df['EMA_12'].iloc[-1] < df['EMA_26'].iloc[-1] and not economic_pause)
+            # 修改：計算每個子條件的分數（True=1, False=0），並記錄
+            buy_sub_scores = {
+                'rsi<35': 1 if rsi < 35 else 0,  # 放寬到35
+                'macd>signal': 1 if macd > macd_signal else 0,
+                'stoch_k<30': 1 if stoch_k < 30 else 0,  # 放寬到30
+                'adx>20': 1 if adx > 20 else 0,  # 放寬到20
+                'ichimoku_buy': 1 if ichimoku_buy else 0,
+                'bb_buy': 1 if bb_buy else 0,
+                'ema_signal': 1 if ema_signal else 0,
+                'not_pause': 1 if not economic_pause else 0  # 僅高影響扣分
+            }
+            sell_sub_scores = {
+                'rsi>65': 1 if rsi > 65 else 0,  # 放寬到65
+                'macd<signal': 1 if macd < macd_signal else 0,
+                'stoch_k>70': 1 if stoch_k > 70 else 0,  # 放寬到70
+                'adx>20': 1 if adx > 20 else 0,
+                'ichimoku_sell': 1 if ichimoku_sell else 0,
+                'bb_sell': 1 if bb_sell else 0,
+                'not_ema_signal': 1 if not ema_signal else 0,
+                'not_pause': 1 if not economic_pause else 0
+            }
             
-            buy_signals.append(buy_condition)
-            sell_signals.append(sell_condition)
+            # 記錄子條件
+            logging.debug(f"{tf} buy sub-conditions: {buy_sub_scores}")
+            logging.debug(f"{tf} sell sub-conditions: {sell_sub_scores}")
+            print(f"{tf} buy sub-conditions: {buy_sub_scores}")
+            print(f"{tf} sell sub-conditions: {sell_sub_scores}")
+            
+            # 若總分 >=5（滿分8的62.5%），視為觸發
+            buy_condition = sum(buy_sub_scores.values()) >= 5
+            sell_condition = sum(sell_sub_scores.values()) >= 5
+            
+            buy_scores.append(sum(buy_sub_scores.values()) / 8)  # 正規化到0-1
+            sell_scores.append(sum(sell_sub_scores.values()) / 8)
             
             decision_log[tf] = {
                 "rsi": float(rsi),
@@ -1444,18 +1533,20 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
                 "macd_signal": float(macd_signal),
                 "stoch_k": float(stoch_k),
                 "adx": float(adx),
-                "ichimoku_buy": bool(ichimoku_buy),  # 將 numpy.bool_ 轉為 Python bool
-                "ichimoku_sell": bool(ichimoku_sell),  # 將 numpy.bool_ 轉為 Python bool
-                "bb_buy": bool(bb_buy),  # 將 numpy.bool_ 轉為 Python bool
-                "bb_sell": bool(bb_sell),  # 將 numpy.bool_ 轉為 Python bool
-                "ema_signal": bool(ema_signal),  # 將 numpy.bool_ 轉為 Python bool
+                "ichimoku_buy": bool(ichimoku_buy),
+                "ichimoku_sell": bool(ichimoku_sell),
+                "bb_buy": bool(bb_buy),
+                "bb_sell": bool(bb_sell),
+                "ema_signal": bool(ema_signal),
                 "economic_impact": economic_impact,
-                "buy_condition": bool(buy_condition),  # 將 numpy.bool_ 轉為 Python bool
-                "sell_condition": bool(sell_condition)  # 將 numpy.bool_ 轉為 Python bool
+                "buy_sub_scores": buy_sub_scores,
+                "sell_sub_scores": sell_sub_scores,
+                "buy_condition": bool(buy_condition),
+                "sell_condition": bool(sell_condition)
             }
         
-        buy_score = sum(buy_signals) / len(buy_signals) if buy_signals else 0
-        sell_score = sum(sell_signals) / len(sell_signals) if sell_signals else 0
+        buy_score = sum(buy_scores) / len(buy_scores) if buy_scores else 0
+        sell_score = sum(sell_scores) / len(sell_scores) if sell_scores else 0
         
         if abs(sentiment) > 0.8:
             logging.warning(f"極端情緒分數: {sentiment}，決策為持有", extra={'mode': 'decision'})
@@ -1464,7 +1555,7 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
             logging.info(f"決策詳情: {json.dumps(decision_log, ensure_ascii=False)}", extra={'mode': 'decision'})
             return "持有"
         
-        sentiment_adjust = 0.2 if sentiment > 0.4 else -0.2 if sentiment < -0.4 else 0.0
+        sentiment_adjust = 0.3 if sentiment > 0.3 else -0.3 if sentiment < -0.3 else 0.0
         buy_score += sentiment_adjust
         sell_score -= sentiment_adjust
         decision_log["sentiment_adjust"] = sentiment_adjust
@@ -1472,8 +1563,9 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
         obs = []
         for tf in ['1h', '4h', '1d']:
             df = data_frames.get(tf, pd.DataFrame())
+            idx = step if step is not None else -1
             if not df.empty and all(f in df.columns for f in FEATURES[:-1]):
-                obs.append(df[FEATURES[:-1]].iloc[-1].values)
+                obs.append(df[FEATURES[:-1]].iloc[idx].values)
             else:
                 obs.append(np.zeros(len(FEATURES) - 1))
         obs = np.array(obs, dtype=np.float32).flatten()
@@ -1481,13 +1573,23 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
         ppo_action = ["買入", "賣出", "持有"][action]
         decision_log["ppo_action"] = ppo_action
         
-        if buy_score > 0.6 and ppo_action == "買入":
+        # 修改：PPO 匹配加 0.1 分，不匹配減 0.1
+        if ppo_action == "買入":
+            buy_score += 0.1
+        elif ppo_action == "賣出":
+            sell_score += 0.1
+        else:
+            buy_score -= 0.1
+            sell_score -= 0.1
+        
+        # 修改：門檻降低到 >0.5
+        if buy_score > 0.5 and (ppo_action == "買入" or buy_score > 0.6):  # 若 PPO 不匹配，需更高得分
             decision_log["final_decision"] = "買入"
             logging.info(f"決策：買入，買入得分={buy_score:.2f}, PPO行動={ppo_action}, 情緒調整={sentiment_adjust:.2f}", extra={'mode': 'decision'})
             print(f"決策：買入，原因：買入得分 {buy_score:.2f}，PPO 預測買入，情緒調整 {sentiment_adjust:.2f}")
             logging.info(f"決策詳情: {json.dumps(decision_log, ensure_ascii=False)}", extra={'mode': 'decision'})
             return "買入"
-        elif sell_score > 0.6 and ppo_action == "賣出":
+        elif sell_score > 0.5 and (ppo_action == "賣出" or sell_score > 0.6):
             decision_log["final_decision"] = "賣出"
             logging.info(f"決策：賣出，賣出得分={sell_score:.2f}, PPO行動={ppo_action}, 情緒調整={sentiment_adjust:.2f}", extra={'mode': 'decision'})
             print(f"決策：賣出，原因：賣出得分 {sell_score:.2f}，PPO 預測賣出，情緒調整 {sentiment_adjust:.2f}")
@@ -1500,13 +1602,15 @@ def make_decision(model, data_frames: dict, sentiment: float) -> str:
             print(f"決策：持有，原因：{reason}")
             logging.info(f"決策詳情: {json.dumps(decision_log, ensure_ascii=False)}", extra={'mode': 'decision'})
             return "持有"
-    except Exception as e:
-        logging.error(f"決策錯誤: {e}, traceback={traceback.format_exc()}", extra={'mode': 'decision'})
-        print(f"決策：持有，原因：決策過程發生錯誤 {str(e)}")
-        return "持有"
 
 async def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 10000, spread: float = 0.0002) -> dict:
-    """回測：模擬交易，顯示每日進度。"""
+    """回測：模擬交易，顯示每日進度，儲存交易記錄到 backtest_trades 表和 CSV。"""
+    # 生成唯一的 backtest_id
+    backtest_id = str(uuid.uuid4())
+    logging.info(f"開始回測，Backtest ID: {backtest_id}", extra={'mode': 'backtest'})
+    
+    config = load_settings()
+    db_path = config.get('system_config', {}).get('db_path', 'C:\\Trading\\data\\trading_data.db')
     capital = initial_capital
     position_size = 0.0
     entry_price = None
@@ -1515,7 +1619,8 @@ async def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float 
     total_steps = len(df)
     last_date = None
     
-    for i, row in df.iterrows():
+    for i in range(len(df)):
+        row = df.iloc[i]
         current_date = row['date'].date()
         if last_date != current_date:
             progress = (i + 1) / total_steps * 100
@@ -1527,37 +1632,94 @@ async def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float 
             logging.warning("資源不足，跳過交易", extra={'mode': 'backtest'})
             continue
         
-        action = await strategy(row)
+        action = await strategy(row, i)
         current_price = row['close']
         sentiment = row.get('sentiment', 0.0)
         atr = row['ATR']
-        stop_loss_distance = abs(calculate_stop_loss(current_price, atr, action) - current_price)
+        stop_loss = calculate_stop_loss(current_price, atr, action)
+        take_profit = calculate_take_profit(current_price, atr, action)
+        stop_loss_distance = abs(stop_loss - current_price)
         
-        # 使用事件循環運行異步函數
         # 異步計算倉位大小
-        position_size_calc = await calculate_position_size(initial_capital, 0.01, stop_loss_distance, sentiment)
+        position_size_calc = await calculate_position_size(initial_capital, 0.01, stop_loss_distance, sentiment, db_path)
         
         if action == "買入" and position_size <= 0:
             if position_size < 0:
                 profit = (entry_price - current_price) * abs(position_size)
                 capital += profit
-                trades.append({'date': row['date'], 'action': '平空', 'price': current_price, 'profit': profit, 'position_size': position_size})
+                trades.append({
+                    'timestamp': row['date'],
+                    'symbol': 'USDJPY',
+                    'price': current_price,
+                    'action': '平空',
+                    'volume': abs(position_size),
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'profit': profit,
+                    'backtest_id': backtest_id
+                })
             position_size = position_size_calc
             entry_price = current_price
-            capital -= abs(position_size) * 0.0001
-            trades.append({'date': row['date'], 'action': '買入', 'price': current_price, 'profit': 0.0, 'position_size': position_size})
+            capital -= abs(position_size) * spread
+            trades.append({
+                'timestamp': row['date'],
+                'symbol': 'USDJPY',
+                'price': current_price,
+                'action': '買入',
+                'volume': position_size,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'profit': 0.0,
+                'backtest_id': backtest_id
+            })
         elif action == "賣出" and position_size >= 0:
             if position_size > 0:
                 profit = (current_price - entry_price) * position_size
                 capital += profit
-                trades.append({'date': row['date'], 'action': '平多', 'price': current_price, 'profit': profit, 'position_size': position_size})
+                trades.append({
+                    'timestamp': row['date'],
+                    'symbol': 'USDJPY',
+                    'price': current_price,
+                    'action': '平多',
+                    'volume': position_size,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'profit': profit,
+                    'backtest_id': backtest_id
+                })
             position_size = -position_size_calc
             entry_price = current_price
-            capital -= abs(position_size) * 0.0001
-            trades.append({'date': row['date'], 'action': '賣出', 'price': current_price, 'profit': 0.0, 'position_size': position_size})
+            capital -= abs(position_size) * spread
+            trades.append({
+                'timestamp': row['date'],
+                'symbol': 'USDJPY',
+                'price': current_price,
+                'action': '賣出',
+                'volume': abs(position_size),
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'profit': 0.0,
+                'backtest_id': backtest_id
+            })
         
         equity = capital + (current_price - entry_price) * position_size if position_size != 0 else capital
         equity_curve.append(equity)
+    
+    # 儲存交易記錄到 backtest_trades 表
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        success = await save_data(trades_df, timeframe='1d', db_path=db_path, data_type='backtest_trades')
+        if success:
+            logging.info(f"成功儲存 {len(trades_df)} 筆回測交易記錄到 backtest_trades 表，Backtest ID: {backtest_id}", extra={'mode': 'backtest'})
+        else:
+            logging.error(f"儲存回測交易記錄到 backtest_trades 表失敗，Backtest ID: {backtest_id}", extra={'mode': 'backtest'})
+        
+        # 儲存交易記錄到 CSV
+        report_dir = Path('reports')
+        report_dir.mkdir(exist_ok=True)
+        trades_csv_path = report_dir / f'backtest_trades_{backtest_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        trades_df.to_csv(trades_csv_path, index=False)
+        logging.info(f"回測交易記錄已儲存到 CSV: {trades_csv_path}", extra={'mode': 'backtest'})
     
     equity_series = pd.Series(equity_curve)
     returns = equity_series.pct_change().dropna()
@@ -1566,9 +1728,24 @@ async def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float 
         "sharpe_ratio": (returns.mean() * 252 - 0.02) / (returns.std() * np.sqrt(252)) if returns.std() != 0 else 0,
         "max_drawdown": (equity_series / equity_series.cummax() - 1).min(),
         "win_rate": len([r for r in returns if r > 0]) / len(returns) if len(returns) > 0 else 0,
-        "trades": trades
+        "trades": trades,
+        "backtest_id": backtest_id
     }
-    logging.info(f"回測結果：最終資本={capital:.2f}, 夏普比率={result['sharpe_ratio']:.2f}, 最大回撤={result['max_drawdown']:.2f}, 勝率={result['win_rate']:.2f}", extra={'mode': 'backtest'})
+    logging.info(f"回測結果：最終資本={capital:.2f}, 夏普比率={result['sharpe_ratio']:.2f}, 最大回撤={result['max_drawdown']:.2f}, 勝率={result['win_rate']:.2f}, Backtest ID={backtest_id}", extra={'mode': 'backtest'})
+    
+    # 儲存回測總結報告
+    report_dir = Path('reports')
+    report_dir.mkdir(exist_ok=True)
+    report_csv_path = report_dir / f'backtest_report_{backtest_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    pd.DataFrame([{
+        'final_capital': result['final_capital'],
+        'sharpe_ratio': result['sharpe_ratio'],
+        'max_drawdown': result['max_drawdown'],
+        'win_rate': result['win_rate'],
+        'backtest_id': result['backtest_id']
+    }]).to_csv(report_csv_path, index=False)
+    logging.info(f"回測總結報告已生成: {report_csv_path}", extra={'mode': 'backtest'})
+    
     return result
 
 def connect_ib(host='127.0.0.1', port=7497, client_id=1):
@@ -1703,7 +1880,6 @@ async def initialize_db(db_path: str):
                     BB_lower REAL DEFAULT 0.0,
                     EMA_12 REAL DEFAULT 0.0,
                     EMA_26 REAL DEFAULT 0.0,
-                    fed_funds_rate REAL DEFAULT 0.0,
                     PRIMARY KEY (date, timeframe)
                 )
             """))
@@ -1712,8 +1888,13 @@ async def initialize_db(db_path: str):
                     date DATETIME,
                     event TEXT,
                     impact TEXT,
-                    fed_funds_rate REAL DEFAULT 0.0,
                     PRIMARY KEY (date, event)
+                )
+            """))
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fed_funds_rate (
+                    date DATETIME PRIMARY KEY,
+                    fed_funds_rate REAL DEFAULT 0.0
                 )
             """))
             await conn.execute(text("""
@@ -1760,13 +1941,31 @@ async def initialize_db(db_path: str):
                     take_profit REAL DEFAULT 0.0
                 )
             """))
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS backtest_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME,
+                    symbol TEXT,
+                    price REAL DEFAULT 0.0,
+                    action TEXT,
+                    volume REAL DEFAULT 0.0,
+                    stop_loss REAL DEFAULT 0.0,
+                    take_profit REAL DEFAULT 0.0,
+                    profit REAL DEFAULT 0.0,
+                    backtest_id TEXT,
+                    PRIMARY KEY (id, backtest_id)
+                )
+            """))
             # 添加索引優化
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_date ON ohlc(date)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_date_event ON economic_calendar(date, event)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_fed_date ON fed_funds_rate(date)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_date_tweet ON tweets(date, tweet_id)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sentiment_date ON sentiment_data(date)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_id ON users(user_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_trades_timestamp ON backtest_trades(timestamp)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_backtest_id ON backtest_trades(backtest_id)"))
         await backup_database(db_path, root_dir)
         logging.info(f"資料庫初始化完成: {db_path}")
     except Exception as e:
@@ -1807,13 +2006,16 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
                     Column('BB_lower', Float),
                     Column('EMA_12', Float),
                     Column('EMA_26', Float),
-                    Column('fed_funds_rate', Float),
                     schema=None
                 ),
                 'economic': Table('economic_calendar', metadata,
                     Column('date', DateTime),
                     Column('event', Text),
                     Column('impact', Text),
+                    schema=None
+                ),
+                'fed_funds': Table('fed_funds_rate', metadata,
+                    Column('date', DateTime),
                     Column('fed_funds_rate', Float),
                     schema=None
                 ),
@@ -1826,7 +2028,7 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
                     Column('date', DateTime),
                     Column('tweet_id', Text),
                     Column('text', Text),
-                    Column('user_id', Text), 
+                    Column('user_id', Text),
                     schema=None
                 ),
                 'users': Table('users', metadata,
@@ -1852,6 +2054,19 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
                     Column('stop_loss', Float),
                     Column('take_profit', Float),
                     schema=None
+                ),
+                'backtest_trades': Table('backtest_trades', metadata,
+                    Column('id', Integer, primary_key=True, autoincrement=True),
+                    Column('timestamp', DateTime),
+                    Column('symbol', Text),
+                    Column('price', Float),
+                    Column('action', Text),
+                    Column('volume', Float),
+                    Column('stop_loss', Float),
+                    Column('take_profit', Float),
+                    Column('profit', Float),
+                    Column('backtest_id', Text),
+                    schema=None
                 )
             }
 
@@ -1862,13 +2077,15 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
 
             # 先定義 df_to_save
             column_maps = {
-                'ohlc': ['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw', 'RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ATR', 'Stoch_k', 'ADX', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'Ichimoku_span_a', 'Ichimoku_span_b', 'Ichimoku_cloud_top', 'BB_upper', 'BB_middle', 'BB_lower', 'EMA_12', 'EMA_26', 'fed_funds_rate'],
-                'economic': ['date', 'event', 'impact', 'fed_funds_rate'],
+                'ohlc': ['date', 'open', 'high', 'low', 'close', 'volume', 'n', 'vw', 'RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ATR', 'Stoch_k', 'ADX', 'Ichimoku_tenkan', 'Ichimoku_kijun', 'Ichimoku_span_a', 'Ichimoku_span_b', 'Ichimoku_cloud_top', 'BB_upper', 'BB_middle', 'BB_lower', 'EMA_12', 'EMA_26'],
+                'economic': ['date', 'event', 'impact'],
+                'fed_funds': ['date', 'fed_funds_rate'],
                 'sentiment': ['date', 'sentiment'],
                 'tweets': ['date', 'tweet_id', 'text', 'user_id'],
                 'users': ['user_id', 'username', 'verified'],
                 'news': ['date', 'news_id', 'news_content', 'source'],
-                'trades': ['id', 'timestamp', 'symbol', 'price', 'action', 'volume', 'stop_loss', 'take_profit']
+                'trades': ['id', 'timestamp', 'symbol', 'price', 'action', 'volume', 'stop_loss', 'take_profit'],
+                'backtest_trades': ['id', 'timestamp', 'symbol', 'price', 'action', 'volume', 'stop_loss', 'take_profit', 'profit', 'backtest_id']
             }
             columns = column_maps.get(data_type, [])
             if not columns:
@@ -1891,7 +2108,7 @@ async def save_data(df: pd.DataFrame, timeframe: str, db_path: str, data_type: s
 
             if data_type == 'ohlc':
                 df_to_save['timeframe'] = timeframe
-            date_column = 'date' if data_type != 'trades' else 'timestamp'
+            date_column = 'date' if data_type != 'trades' and data_type != 'backtest_trades' else 'timestamp'
             if date_column in df_to_save.columns:
                 if not pd.api.types.is_datetime64_any_dtype(df_to_save[date_column]):
                     try:
@@ -2034,8 +2251,6 @@ def load_settings():
                 with open(file_path, 'w', encoding='utf-8') as f:
                     json.dump(default, f, indent=4, ensure_ascii=False)
                 logging.info(f"創建預設配置文件: {file_path}")
-        if 'api_key' in config:
-            config['api_key'].update({k: encrypt_key(v) for k, v in config['api_key'].items() if v})
         system_config = config.get('system_config', {})
         dependencies = system_config.get('dependencies', []) or ["pandas>=2.0.0",
                 "yfinance>=0.2.0",
