@@ -1602,6 +1602,10 @@ def make_decision(model, data_frames: dict, sentiment: float, step: int = None) 
             print(f"決策：持有，原因：{reason}")
             logging.info(f"決策詳情: {json.dumps(decision_log, ensure_ascii=False)}", extra={'mode': 'decision'})
             return "持有"
+    except Exception as e:
+        logging.error(f"決策錯誤: {e}, traceback={traceback.format_exc()}", extra={'mode': 'decision'})
+        print(f"決策：持有，原因：決策過程發生錯誤 {str(e)}")
+        return "持有"
 
 async def backtest(df: pd.DataFrame, strategy: callable, initial_capital: float = 10000, spread: float = 0.0002) -> dict:
     """回測：模擬交易，顯示每日進度，儲存交易記錄到 backtest_trades 表和 CSV。"""
